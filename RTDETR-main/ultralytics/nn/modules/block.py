@@ -13,6 +13,103 @@ __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', '
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
            'BottleNeck', 'Blocks')
 
+import torch
+import torch.nn as nn
+from torch.nn import functional as F  # Assuming Conv uses this if needed
+
+# Assuming Conv is defined elsewhere, e.g., a simple Conv wrapper
+class Conv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
+        super().__init__()
+        p = k // 2 if p is None else p
+        self.conv = nn.Conv2d(c1, c2, k, s, p, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+# DropPath definition (required for GatedCNNBlockAdapted)
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+# GatedCNNBlockAdapted (channel-first adapted)
+class GatedCNNBlockAdapted(nn.Module):
+    def __init__(self, dim, expansion_ratio=8/3, kernel_size=3, conv_ratio=1.0, drop_path=0.):
+        super().__init__()
+        self.norm = nn.BatchNorm2d(dim)
+        hidden = int(expansion_ratio * dim)
+        self.fc1 = nn.Conv2d(dim, hidden * 2, 1)
+        self.act = nn.GELU()
+        conv_channels = int(conv_ratio * dim)
+        self.split_indices = (hidden, hidden - conv_channels, conv_channels)
+        self.conv = nn.Conv2d(conv_channels, conv_channels, kernel_size=kernel_size, padding=kernel_size//2, groups=conv_channels)
+        self.fc2 = nn.Conv2d(hidden, dim, 1)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm(x)
+        g, i, c = torch.split(self.fc1(x), self.split_indices, dim=1)
+        c = self.conv(c)
+        x = self.fc2(self.act(g) * torch.cat((i, c), dim=1))
+        x = self.drop_path(x)
+        return x + shortcut
+
+# GatedDSABlock (adapted to match Bottleneck interface)
+class GatedDSABlock(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=1.0, drop_path=0.):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels, matching original Bottleneck
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.spatial_gating_unit = GatedCNNBlockAdapted(c2, kernel_size=k[1], drop_path=drop_path)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        out = self.cv2(self.cv1(x))
+        out = self.spatial_gating_unit(out)
+        return x + out if self.add else out
+
+# Modified C2f with GatedDSABlock replacement
+class C2f(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(GatedDSABlock(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
 
 class DFL(nn.Module):
     """
