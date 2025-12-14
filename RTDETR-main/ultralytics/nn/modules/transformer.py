@@ -14,6 +14,77 @@ from .utils import _get_clones, inverse_sigmoid, multi_scale_deformable_attn_pyt
 __all__ = ('TransformerEncoderLayer', 'TransformerLayer', 'TransformerBlock', 'MLPBlock', 'LayerNorm2d', 'AIFI',
            'DeformableTransformerDecoder', 'DeformableTransformerDecoderLayer', 'MSDeformAttn', 'MLP')
 
+class CASAIFIEncoderLayer(nn.Module):
+    def __init__(self,
+                 d_model,
+                 dim_feedforward=1024,
+                 dropout=0.1,
+                 activation="gelu",
+                 normalize_before=False):
+        super().__init__()
+        self.normalize_before = normalize_before
+
+        self.casatt = CASAtt(d_model, proj_drop=dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = get_activation(activation)
+
+    def forward(self, src, src_mask=None, pos_embed=None):
+        # src: [B, HW, C]
+        residual = src
+        if self.normalize_before:
+            src = self.norm1(src)
+
+        B, N, C = src.shape
+        H = W = int(N ** 0.5)
+        assert H * W == N, "CAS-AIFI requires square feature map"
+
+        x = src.transpose(1, 2).reshape(B, C, H, W)
+
+        if pos_embed is not None:
+            pos = pos_embed.transpose(1, 2).reshape(1, C, H, W)
+            x = x + pos
+
+        x = self.casatt(x)
+
+        src2 = x.flatten(2).transpose(1, 2)
+        src = residual + self.dropout1(src2)
+
+        if not self.normalize_before:
+            src = self.norm1(src)
+
+        residual = src
+        if self.normalize_before:
+            src = self.norm2(src)
+
+        src = self.linear2(self.activation(self.linear1(src)))
+        src = residual + self.dropout2(src)
+
+        if not self.normalize_before:
+            src = self.norm2(src)
+
+        return src
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, encoder_layer, num_layers):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [copy.deepcopy(encoder_layer) for _ in range(num_layers)]
+        )
+
+    def forward(self, src, src_mask=None, pos_embed=None):
+        for layer in self.layers:
+            src = layer(src, src_mask=src_mask, pos_embed=pos_embed)
+        return src
 
 class TransformerEncoderLayer(nn.Module):
     """Defines a single layer of the transformer encoder."""
