@@ -11,7 +11,7 @@ from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
-           'BottleNeck', 'Blocks','C2f_MambaOut_DSA')
+           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','MPCAFSAFusionLayer')
 
 
 # Assuming Conv is defined elsewhere, e.g., a simple Conv wrapper
