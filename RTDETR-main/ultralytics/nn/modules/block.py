@@ -622,3 +622,207 @@ class Blocks(nn.Module):
         for block in self.blocks:
             out = block(out)
         return out
+class ConvNormLayer(nn.Module):
+    """基础卷积-归一化层"""
+    def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            ch_in, 
+            ch_out, 
+            kernel_size, 
+            stride, 
+            padding=(kernel_size-1)//2 if padding is None else padding, 
+            bias=bias)
+        self.norm = nn.BatchNorm2d(ch_out)
+        if act == 'silu':
+            self.act = nn.SiLU()
+        elif act == 'relu':
+            self.act = nn.ReLU(inplace=True)
+        elif act == 'gelu':
+            self.act = nn.GELU()
+        else:
+            self.act = nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+class MPCA(nn.Module):
+    """Multi-scale Pyramid Channel Attention Module"""
+    def __init__(self, input_channel1, input_channel2, gamma=2, bias=1):
+        super(MPCA, self).__init__()
+        self.input_channel1 = input_channel1
+        self.input_channel2 = input_channel2
+
+        self.avg1 = nn.AdaptiveAvgPool2d(1)
+        self.avg2 = nn.AdaptiveAvgPool2d(1)
+
+        kernel_size1 = int(abs((math.log(input_channel1, 2) + bias) / gamma))
+        kernel_size1 = kernel_size1 if kernel_size1 % 2 else kernel_size1 + 1
+
+        kernel_size2 = int(abs((math.log(input_channel2, 2) + bias) / gamma))
+        kernel_size2 = kernel_size2 if kernel_size2 % 2 else kernel_size2 + 1
+
+        kernel_size3 = int(abs((math.log(input_channel1 + input_channel2, 2) + bias) / gamma))
+        kernel_size3 = kernel_size3 if kernel_size3 % 2 else kernel_size3 + 1
+
+        self.conv1 = nn.Conv1d(1, 1, kernel_size=kernel_size1, padding=(kernel_size1 - 1) // 2, bias=False)
+        self.conv2 = nn.Conv1d(1, 1, kernel_size=kernel_size2, padding=(kernel_size2 - 1) // 2, bias=False)
+        self.conv3 = nn.Conv1d(1, 1, kernel_size=kernel_size3, padding=(kernel_size3 - 1) // 2, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x1, x2):
+        """
+        x1: [B, C1, H, W]
+        x2: [B, C2, H, W]
+        return: [B, C1, H, W]
+        """
+        x1_ = self.avg1(x1)
+        x2_ = self.avg2(x2)
+
+        x1_ = self.conv1(x1_.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        x2_ = self.conv2(x2_.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+
+        x_middle = torch.cat((x1_, x2_), dim=1)
+        x_middle = self.conv3(x_middle.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        x_middle = self.sigmoid(x_middle)
+
+        x_1, x_2 = torch.split(x_middle, [self.input_channel1, self.input_channel2], dim=1)
+
+        x1_out = x1 * x_1
+        x2_out = x2 * x_2
+
+        result = x1_out + x2_out
+        return result
+
+
+class SpatialAttention(nn.Module):
+    """Spatial Attention Module"""
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        self.conv1 = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv1(out)
+        out = self.sigmoid(out)
+        result = x * out
+        return result
+
+
+class Adaptive_global_filter(nn.Module):
+    """Adaptive Global Filter for frequency domain processing"""
+    def __init__(self, ratio=10, dim=32, H=64, W=64):
+        super().__init__()
+        self.ratio = ratio
+        self.filter = nn.Parameter(torch.randn(dim, H, W, 2, dtype=torch.float32), requires_grad=True)
+        self.register_buffer('mask_low', torch.zeros(size=(H, W)))
+        self.register_buffer('mask_high', torch.ones(size=(H, W)))
+        
+        # Initialize masks
+        crow, ccol = int(H / 2), int(W / 2)
+        self.mask_low[crow - ratio:crow + ratio, ccol - ratio:ccol + ratio] = 1
+        self.mask_high[crow - ratio:crow + ratio, ccol - ratio:ccol + ratio] = 0
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        
+        # Resize filter if needed
+        if h != self.filter.shape[1] or w != self.filter.shape[2]:
+            filter_resized = F.interpolate(
+                self.filter.permute(0, 3, 1, 2), 
+                size=(h, w), 
+                mode='bilinear', 
+                align_corners=False
+            ).permute(0, 2, 3, 1)
+            
+            # Resize masks
+            mask_low = F.interpolate(
+                self.mask_low.unsqueeze(0).unsqueeze(0), 
+                size=(h, w), 
+                mode='nearest'
+            ).squeeze()
+            mask_high = F.interpolate(
+                self.mask_high.unsqueeze(0).unsqueeze(0), 
+                size=(h, w), 
+                mode='nearest'
+            ).squeeze()
+        else:
+            filter_resized = self.filter
+            mask_low = self.mask_low
+            mask_high = self.mask_high
+
+        x_fre = torch.fft.fftshift(torch.fft.fft2(x, dim=(-2, -1), norm='ortho'))
+        weight = torch.view_as_complex(filter_resized)
+
+        x_fre_low = torch.mul(x_fre, mask_low)
+        x_fre_high = torch.mul(x_fre, mask_high)
+
+        x_fre_low = torch.mul(x_fre_low, weight)
+        x_fre_new = x_fre_low + x_fre_high
+        x_out = torch.fft.ifft2(torch.fft.ifftshift(x_fre_new, dim=(-2, -1))).real
+        return x_out
+
+
+class FSA(nn.Module):
+    """Frequency-Spatial Attention Module"""
+    def __init__(self, input_channel, ratio=10):
+        super(FSA, self).__init__()
+        self.agf = Adaptive_global_filter(ratio=ratio, dim=input_channel, H=64, W=64)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        f_out = self.agf(x)
+        sa_out = self.sa(x)
+        result = f_out + sa_out
+        return result
+
+
+class MPCAFSAFusionLayer(nn.Module):
+    """
+    MPCA-FSA Fusion Layer: 结合MPCA和FSA的新型特征融合模块
+    用于替代CSPRepLayer
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 expansion=1.0,
+                 fsa_ratio=10,
+                 act="silu"):
+        super(MPCAFSAFusionLayer, self).__init__()
+        
+        hidden_channels = int(out_channels * expansion)
+        
+        # 分支1：使用FSA进行频域-空间域增强
+        self.conv1 = ConvNormLayer(in_channels, hidden_channels, 1, 1, act=act)
+        self.fsa = FSA(input_channel=hidden_channels, ratio=fsa_ratio)
+        
+        # 分支2：简单的通道投影
+        self.conv2 = ConvNormLayer(in_channels, hidden_channels, 1, 1, act=act)
+        
+        # MPCA融合两个分支
+        self.mpca = MPCA(input_channel1=hidden_channels, input_channel2=hidden_channels)
+        
+        # 输出投影
+        if hidden_channels != out_channels:
+            self.conv3 = ConvNormLayer(hidden_channels, out_channels, 1, 1, act=act)
+        else:
+            self.conv3 = nn.Identity()
+
+    def forward(self, x):
+        # 分支1：频域-空间域增强
+        x_1 = self.conv1(x)
+        x_1 = self.fsa(x_1)
+        
+        # 分支2：直接投影
+        x_2 = self.conv2(x)
+        
+        # MPCA融合
+        x_fused = self.mpca(x_1, x_2)
+        
+        # 输出投影
+        return self.conv3(x_fused)
