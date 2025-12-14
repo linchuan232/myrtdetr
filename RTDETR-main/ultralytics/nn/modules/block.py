@@ -11,11 +11,8 @@ from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
-           'BottleNeck', 'Blocks')
+           'BottleNeck', 'Blocks','C2f_MambaOut_DSA')
 
-import torch
-import torch.nn as nn
-from torch.nn import functional as F  # Assuming Conv uses this if needed
 
 # Assuming Conv is defined elsewhere, e.g., a simple Conv wrapper
 class Conv(nn.Module):
@@ -84,7 +81,7 @@ class GatedDSABlock(nn.Module):
         return x + out if self.add else out
 
 # Modified C2f with GatedDSABlock replacement
-class C2f(nn.Module):
+class C2f_MambaOut_DSA(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
