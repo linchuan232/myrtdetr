@@ -5,13 +5,504 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
+import math
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
 from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
-           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','MPCAFSAFusionLayer')
+           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','MPCAFSAFusionLayer','BasicBlock_Hybrid_Full','BasicBlock_Hybrid_Lite','BasicBlock_Hybrid_Fast')
+
+def autopad(k, p=None, d=1):
+    """自动填充以保持输出尺寸"""
+    if d > 1:
+        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
+    if p is None:
+        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
+    return p
+
+
+class Conv(nn.Module):
+    """标准卷积层 + BN + 激活"""
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = (
+            self.default_act if act is True
+            else act if isinstance(act, nn.Module)
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+# ============================================================================
+# 频域处理组件（来自 SFS_Conv）
+# ============================================================================
+
+class FractionalGaborFilter(nn.Module):
+    """分数阶Gabor滤波器"""
+    def __init__(self, in_channels, out_channels, kernel_size, order, angles, scales):
+        super().__init__()
+        self.real_weights = nn.ParameterList()
+        
+        for angle in angles:
+            for scale in scales:
+                real_weight = self.generate_fractional_gabor(
+                    in_channels, out_channels, kernel_size, order, angle, scale
+                )
+                self.real_weights.append(nn.Parameter(real_weight))
+
+    def generate_fractional_gabor(self, in_channels, out_channels, size, order, angle, scale):
+        x, y = np.meshgrid(np.linspace(-1, 1, size[0]), np.linspace(-1, 1, size[1]))
+        x_theta = x * np.cos(angle) + y * np.sin(angle)
+        y_theta = -x * np.sin(angle) + y * np.cos(angle)
+        
+        real_part = np.exp(-((x_theta**2 + (y_theta / scale) ** 2) ** order)) * \
+                    np.cos(2 * np.pi * x_theta / scale)
+        
+        real_weight = torch.tensor(real_part, dtype=torch.float32).view(1, 1, size[0], size[1])
+        real_weight = real_weight.repeat(out_channels, 1, 1, 1)
+        return real_weight
+
+    def forward(self, x):
+        real_result = sum(weight * x for weight in self.real_weights)
+        return real_result
+
+
+class FrequencyUnit(nn.Module):
+    """频域处理单元"""
+    def __init__(self, in_channels, out_channels, kernel_size=(3, 3), order=0.25):
+        super().__init__()
+        angles = [0, np.pi/4, np.pi/2]
+        scales = [1, 2]
+        
+        self.gabor = FractionalGaborFilter(
+            in_channels, out_channels, kernel_size, order, angles, scales
+        )
+        self.t = nn.Parameter(
+            torch.randn(out_channels, in_channels, kernel_size[0], kernel_size[1]),
+            requires_grad=True,
+        )
+        nn.init.normal_(self.t, std=0.02)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        out = self.gabor(self.t)
+        out = F.conv2d(x, out, stride=1, padding=(out.shape[-2] - 1) // 2)
+        out = self.act(out)
+        return out
+
+
+# ============================================================================
+# 门控空间单元（来自 GatedCNNBlock）
+# ============================================================================
+
+class GatedSpatialUnit(nn.Module):
+    """门控空间处理单元"""
+    def __init__(self, dim, kernel_size=7, conv_ratio=0.5, expansion_ratio=2.0):
+        super().__init__()
+        hidden = int(expansion_ratio * dim)
+        self.fc1 = nn.Linear(dim, hidden * 2)
+        self.act = nn.GELU()
+        
+        conv_channels = int(conv_ratio * dim)
+        self.split_indices = (hidden, hidden - conv_channels, conv_channels)
+        
+        self.conv = nn.Conv2d(
+            conv_channels, conv_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=conv_channels
+        )
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        # x: [B, C, H, W] -> [B, H, W, C]
+        x = x.permute(0, 2, 3, 1)
+        
+        g, i, c = torch.split(self.fc1(x), self.split_indices, dim=-1)
+        c = c.permute(0, 3, 1, 2)
+        c = self.conv(c)
+        c = c.permute(0, 2, 3, 1)
+        
+        x = self.fc2(self.act(g) * torch.cat((i, c), dim=-1))
+        return x.permute(0, 3, 1, 2)
+
+
+# ============================================================================
+# HybridBottleneck 三个版本
+# ============================================================================
+
+class HybridBottleneck_Full(nn.Module):
+    """完整版混合瓶颈块 - 空间+频域"""
+    def __init__(self, c1, c2, shortcut=True, kernel_size=7, expansion=0.5):
+        super().__init__()
+        c_ = int(c2 * expansion)
+        
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.gated_spatial = GatedSpatialUnit(c_, kernel_size=kernel_size, conv_ratio=0.5)
+        self.frequency = FrequencyUnit(c_, c_, kernel_size=(3, 3))
+        
+        self.fusion = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_ * 2, c_ // 2, 1),
+            nn.GELU(),
+            nn.Conv2d(c_ // 2, c_ * 2, 1),
+            nn.Sigmoid()
+        )
+        
+        self.cv2 = Conv(c_ * 2, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        feat = self.cv1(x)
+        spatial_feat = self.gated_spatial(feat)
+        freq_feat = self.frequency(feat)
+        combined = torch.cat([spatial_feat, freq_feat], dim=1)
+        attention = self.fusion(combined)
+        fused = combined * attention
+        out = self.cv2(fused)
+        return x + out if self.add else out
+
+
+class HybridBottleneck_Lite(nn.Module):
+    """轻量版混合瓶颈块 - 选择性频域"""
+    def __init__(self, c1, c2, shortcut=True, kernel_size=7, expansion=0.5):
+        super().__init__()
+        c_ = int(c2 * expansion)
+        c_freq = c_ // 2
+        
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.gated_spatial = GatedSpatialUnit(c_, kernel_size=kernel_size, conv_ratio=0.5)
+        self.frequency = FrequencyUnit(c_freq, c_freq, kernel_size=(3, 3))
+        
+        self.freq_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_freq, c_freq, 1),
+            nn.Sigmoid()
+        )
+        
+        self.cv2 = Conv(c_ + c_freq, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        feat = self.cv1(x)
+        spatial_feat = self.gated_spatial(feat)
+        freq_input = feat[:, :feat.size(1)//2, :, :]
+        freq_feat = self.frequency(freq_input)
+        freq_feat = freq_feat * self.freq_gate(freq_feat)
+        combined = torch.cat([spatial_feat, freq_feat], dim=1)
+        out = self.cv2(combined)
+        return x + out if self.add else out
+
+
+class HybridBottleneck_Fast(nn.Module):
+    """快速版混合瓶颈块 - 仅门控"""
+    def __init__(self, c1, c2, shortcut=True, kernel_size=7, expansion=0.5):
+        super().__init__()
+        c_ = int(c2 * expansion)
+        
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.gated_spatial = GatedSpatialUnit(c_, kernel_size=kernel_size, conv_ratio=0.5)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        feat = self.cv1(x)
+        out = self.gated_spatial(feat)
+        out = self.cv2(out)
+        return x + out if self.add else out
+
+
+# ============================================================================
+# C2f_Hybrid 三个版本 - CSP架构
+# ============================================================================
+
+class C2f_Hybrid_Full(nn.Module):
+    """
+    C2f with HybridBottleneck_Full
+    CSP Bottleneck with 2 convolutions - 完整版
+    
+    特点:
+    - 使用 HybridBottleneck_Full 作为基础模块
+    - 完整的空间+频域处理
+    - CSP架构提供更好的梯度流
+    - 适合对精度要求高的任务
+    
+    参数:
+        c1: 输入通道数
+        c2: 输出通道数
+        n: Bottleneck数量
+        shortcut: 是否使用shortcut连接
+        g: 分组卷积的组数（保留参数，实际在HybridBottleneck中不使用）
+        e: expansion ratio，隐藏层通道扩展比例
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        
+        # 使用 HybridBottleneck_Full 替代原始 Bottleneck
+        self.m = nn.ModuleList(
+            HybridBottleneck_Full(
+                self.c, 
+                self.c, 
+                shortcut=shortcut,
+                kernel_size=7,
+                expansion=1.0
+            ) for _ in range(n)
+        )
+
+    def forward(self, x):
+        """前向传播 - CSP架构"""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """使用split()而非chunk()的前向传播"""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class C2f_Hybrid_Lite(nn.Module):
+    """
+    C2f with HybridBottleneck_Lite
+    CSP Bottleneck with 2 convolutions - 轻量版 ⭐ 推荐
+    
+    特点:
+    - 使用 HybridBottleneck_Lite 作为基础模块
+    - 选择性的频域处理
+    - 平衡精度和效率
+    - 适合大多数应用场景
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        
+        # 使用 HybridBottleneck_Lite
+        self.m = nn.ModuleList(
+            HybridBottleneck_Lite(
+                self.c, 
+                self.c, 
+                shortcut=shortcut,
+                kernel_size=7,
+                expansion=1.0
+            ) for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class C2f_Hybrid_Fast(nn.Module):
+    """
+    C2f with HybridBottleneck_Fast
+    CSP Bottleneck with 2 convolutions - 快速版
+    
+    特点:
+    - 使用 HybridBottleneck_Fast 作为基础模块
+    - 仅门控机制，无频域处理
+    - 最快的推理速度
+    - 适合实时应用
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        
+        # 使用 HybridBottleneck_Fast
+        self.m = nn.ModuleList(
+            HybridBottleneck_Fast(
+                self.c, 
+                self.c, 
+                shortcut=shortcut,
+                kernel_size=7,
+                expansion=1.0
+            ) for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+# ============================================================================
+# 用于替代BasicBlock的包装类
+# ============================================================================
+
+class BasicBlock_Hybrid_Full(nn.Module):
+    """
+    用C2f_Hybrid_Full替代BasicBlock的包装类
+    可直接在ResNet中替换原始BasicBlock
+    
+    使用方法:
+        # 原始: block = BasicBlock(64, 64)
+        # 替换: block = BasicBlock_Hybrid_Full(64, 64)
+    """
+    expansion = 1  # 保持与BasicBlock一致
+    
+    def __init__(self, inplanes, planes, stride=1, downsample=None, n=1):
+        super().__init__()
+        
+        # 如果stride!=1，需要下采样
+        if stride != 1 or inplanes != planes:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(inplanes, planes, 1, stride, bias=False),
+                nn.BatchNorm2d(planes)
+            )
+        else:
+            self.downsample = downsample
+        
+        # 使用C2f_Hybrid_Full
+        # 当stride=1时，直接使用C2f
+        # 当stride!=1时，先下采样再使用C2f
+        if stride == 1:
+            self.c2f = C2f_Hybrid_Full(inplanes, planes, n=n, shortcut=True, e=0.5)
+        else:
+            # 先通过卷积下采样
+            self.stride_conv = nn.Sequential(
+                Conv(inplanes, planes, 3, stride),
+            )
+            self.c2f = C2f_Hybrid_Full(planes, planes, n=n, shortcut=True, e=0.5)
+        
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+        
+        if self.stride != 1:
+            # 先下采样
+            out = self.stride_conv(x)
+            out = self.c2f(out)
+            if self.downsample is not None:
+                identity = self.downsample(x)
+        else:
+            out = self.c2f(x)
+        
+        # 残差连接
+        if identity.shape == out.shape:
+            out += identity
+        elif self.downsample is not None:
+            out += self.downsample(identity)
+            
+        return out
+
+
+class BasicBlock_Hybrid_Lite(nn.Module):
+    """
+    用C2f_Hybrid_Lite替代BasicBlock的包装类 ⭐ 推荐
+    """
+    expansion = 1
+    
+    def __init__(self, inplanes, planes, stride=1, downsample=None, n=1):
+        super().__init__()
+        
+        if stride != 1 or inplanes != planes:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(inplanes, planes, 1, stride, bias=False),
+                nn.BatchNorm2d(planes)
+            )
+        else:
+            self.downsample = downsample
+        
+        if stride == 1:
+            self.c2f = C2f_Hybrid_Lite(inplanes, planes, n=n, shortcut=True, e=0.5)
+        else:
+            self.stride_conv = nn.Sequential(
+                Conv(inplanes, planes, 3, stride),
+            )
+            self.c2f = C2f_Hybrid_Lite(planes, planes, n=n, shortcut=True, e=0.5)
+        
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+        
+        if self.stride != 1:
+            out = self.stride_conv(x)
+            out = self.c2f(out)
+            if self.downsample is not None:
+                identity = self.downsample(x)
+        else:
+            out = self.c2f(x)
+        
+        if identity.shape == out.shape:
+            out += identity
+        elif self.downsample is not None:
+            out += self.downsample(identity)
+            
+        return out
+
+
+class BasicBlock_Hybrid_Fast(nn.Module):
+    """
+    用C2f_Hybrid_Fast替代BasicBlock的包装类
+    """
+    expansion = 1
+    
+    def __init__(self, inplanes, planes, stride=1, downsample=None, n=1):
+        super().__init__()
+        
+        if stride != 1 or inplanes != planes:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(inplanes, planes, 1, stride, bias=False),
+                nn.BatchNorm2d(planes)
+            )
+        else:
+            self.downsample = downsample
+        
+        if stride == 1:
+            self.c2f = C2f_Hybrid_Fast(inplanes, planes, n=n, shortcut=True, e=0.5)
+        else:
+            self.stride_conv = nn.Sequential(
+                Conv(inplanes, planes, 3, stride),
+            )
+            self.c2f = C2f_Hybrid_Fast(planes, planes, n=n, shortcut=True, e=0.5)
+        
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+        
+        if self.stride != 1:
+            out = self.stride_conv(x)
+            out = self.c2f(out)
+            if self.downsample is not None:
+                identity = self.downsample(x)
+        else:
+            out = self.c2f(x)
+        
+        if identity.shape == out.shape:
+            out += identity
+        elif self.downsample is not None:
+            out += self.downsample(identity)
+            
+        return out
 
 
 # Assuming Conv is defined elsewhere, e.g., a simple Conv wrapper
