@@ -12,7 +12,7 @@ from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
-           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','BasicBlock_Hybrid_Full','GatedFusion_Lite','GatedFusion')
+           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','BasicBlock_Hybrid_Full','GatedFusion_Lite','GatedFusion_Tiny')
 
 def autopad(k, p=None, d=1):
     """自动填充以保持输出尺寸"""
@@ -1922,7 +1922,7 @@ class GatedInteractiveFusion_Tiny(nn.Module):
         
         # ========== 简化门控：只用对比控制小波 ==========
         gates = self.gate(x_contrast)  # [B, 4, 1, 1]
-        gates = gates.unsqueeze(2).expand(B, C_hidden, 4, 1, 1)
+        gates = gates.unsqueeze(1).expand(B, C_hidden, 4, 1, 1)
         
         x_wt_reshaped = x_wt_processed.reshape(B, C_hidden, 4, H_wt, W_wt)
         x_wt_gated = x_wt_reshaped * gates
