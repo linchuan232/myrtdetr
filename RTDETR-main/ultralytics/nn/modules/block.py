@@ -10,9 +10,11 @@ import numpy as np
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
 from .transformer import TransformerBlock
 
+from einops import rearrange
+
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
-           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','BasicBlock_Hybrid_Full','GatedFusion_Lite','GatedFusion_Tiny')
+           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','BasicBlock_Hybrid_Full','RepC3_CAB')
 
 def autopad(k, p=None, d=1):
     """自动填充以保持输出尺寸"""
@@ -1113,984 +1115,346 @@ class Blocks(nn.Module):
         for block in self.blocks:
             out = block(out)
         return out
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-
-# ==================== 基础组件 ====================
-
-class MPCA(nn.Module):
-    """Multi-scale Progressive Channel Attention"""
-    def __init__(self, c1, c2, gamma=2, bias=1):
-        super().__init__()
-        self.c1, self.c2 = c1, c2
-        self.avg1 = nn.AdaptiveAvgPool2d(1)
-        self.avg2 = nn.AdaptiveAvgPool2d(1)
-
-        def k(c): 
-            ks = int(abs((math.log(c, 2) + bias) / gamma))
-            return ks if ks % 2 else ks + 1
-
-        self.conv1 = nn.Conv1d(1, 1, k(c1), padding=k(c1)//2, bias=False)
-        self.conv2 = nn.Conv1d(1, 1, k(c2), padding=k(c2)//2, bias=False)
-        self.conv3 = nn.Conv1d(1, 1, k(c1+c2), padding=k(c1+c2)//2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-        self.up = nn.ConvTranspose2d(c2, c1, 2, 2)
-
-    def forward(self, x1, x2):
-        b = x1.shape[0]
-        x1_w = self.conv1(self.avg1(x1).view(b, 1, -1)).view(b, self.c1, 1, 1)
-        x2_w = self.conv2(self.avg2(x2).view(b, 1, -1)).view(b, self.c2, 1, 1)
-        w = torch.cat([x1_w, x2_w], dim=1)
-        w = self.sigmoid(self.conv3(w.view(b, 1, -1)).view(b, self.c1+self.c2, 1, 1))
-        w1, w2 = torch.split(w, [self.c1, self.c2], dim=1)
-        return x1 * w1 + self.up(x2 * w2)
-
-
-class SpatialAttention(nn.Module):
-    """Spatial Attention"""
-    def __init__(self, kernel_size=7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg = x.mean(1, keepdim=True)
-        maxv, _ = x.max(1, keepdim=True)
-        return x * self.sigmoid(self.conv(torch.cat([avg, maxv], 1)))
-
-
-# ==================== 方案1: 轻量级 ====================
-
-class MPCA_Spatial(nn.Module):
-    """轻量级融合 - 快速验证"""
-    def __init__(self, c1, c2):
-        super().__init__()
-        self.mpca = MPCA(c1, c2)
-        self.spatial = SpatialAttention()
-        self.out = nn.Conv2d(c1, c1, 1)
-
-    def forward(self, x_high, x_low):
-        x = self.mpca(x_high, x_low)
-        x = self.spatial(x)
-        return self.out(x)
-
-
-# ==================== 方案2: 平衡方案 ====================
-
-class FCSF_Lightweight(nn.Module):
-    """平衡的频率感知跨尺度融合"""
-    def __init__(self, c1, c2):
-        super().__init__()
-        self.mpca = MPCA(c1, c2)
-        self.spatial = SpatialAttention()
-        self.channel_attn = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c1, c1 // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c1 // 4, c1, 1),
-            nn.Sigmoid()
-        )
-        self.align = nn.Conv2d(c1, c1, 1)
-
-    def forward(self, x_high, x_low):
-        x_c = self.mpca(x_high, x_low)
-        x_f = self.spatial(x_high)
-        x_f = x_f * self.channel_attn(x_f)
-        return self.align(x_c + x_f)
-
-
-# ==================== 方案3: 最佳性能 ====================
-class GatedFusion(nn.Module):
+class CAB(nn.Module):
     """
-    门控交互融合模块 - YAML配置兼容版本
+    Channel Attention Block - 跨特征注意力
     
-    基于GatedInteractiveFusion_ResNet18，专为遥感图像小目标检测优化
+    特点：
+    - Q来自x，K/V来自y
+    - 多头注意力机制
+    - 深度可分离卷积
+    """
+    def __init__(self, dim, num_heads, bias=False):
+        super(CAB, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        
+        # Query分支
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.q_dwconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim, bias=bias)
+        
+        # Key-Value分支
+        self.kv = nn.Conv2d(dim, dim*2, kernel_size=1, bias=bias)
+        self.kv_dwconv = nn.Conv2d(dim*2, dim*2, kernel_size=3, stride=1, padding=1, groups=dim*2, bias=bias)
+        
+        # 输出投影
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
     
-    用法（在YAML配置文件中）:
-        # 基础用法
-        - [-1, 1, GatedFusion, [256]]  
+    def forward(self, x, y):
+        """
+        Args:
+            x: Query特征 [B, C, H, W]
+            y: Key-Value特征 [B, C, H, W]
+        Returns:
+            输出特征 [B, C, H, W]
+        """
+        b, c, h, w = x.shape
         
-        # 带重复（n>1会堆叠多个GatedFusion）
-        - [-1, 2, GatedFusion, [256]]  
+        # 生成Q, K, V
+        q = self.q_dwconv(self.q(x))
+        kv = self.kv_dwconv(self.kv(y))
+        k, v = kv.chunk(2, dim=1)
         
-    参数说明:
-        c1: 输入通道数（Concat后的通道）
-        c2: 输出通道数（通常256）
-        n: 重复次数（建议1，多了会增加计算量）
-        wt_type: 小波类型 'haar'(最快) | 'db1'(平衡)
-        num_heads: 注意力头数（ResNet18用4）
-        e: expansion（兼容RepC3参数，但GatedFusion内部不使用）
+        # 重排为多头
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        
+        # 归一化
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        
+        # 注意力计算
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = F.softmax(attn, dim=-1)
+        
+        # 输出
+        out = (attn @ v)
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        out = self.project_out(out)
+        
+        return out
+
+
+# ============================================================================
+# 方案1: RepC3_CAB - 用CAB替换RepConv (推荐) ⭐
+# ============================================================================
+
+class RepC3_CAB(nn.Module):
+    """
+    RepC3 with CAB - 用CAB替换RepConv
     
     特点:
-        - Haar小波快速分解（无需pywt库）
-        - 小波-对比双向门控
-        - 频域+空域联合处理
-        - 适合遥感小目标检测
+    - 保持RepC3的CSP结构
+    - 用CAB替换RepConv，增强特征交互
+    - 适合需要强特征融合的场景
     
-    性能:
-        - APs提升: +3.5~4.5%
-        - 推理增加: +2~3ms
-        - 参数增加: 约+15%
+    改进:
+    - 原始RepC3用RepConv进行特征提取
+    - 现在用CAB进行跨分支注意力
+    - 性能提升，参数略增
+    
+    参数:
+    - c1: 输入通道
+    - c2: 输出通道
+    - n: CAB模块数量
+    - num_heads: 注意力头数
+    - e: expansion ratio
+    
+    性能预期:
+    - APs提升: +2.0~2.5%
+    - 参数增加: ~15%
+    - 速度: 略慢5-10%
+    
+    YAML使用:
+        # 替换原始RepC3
+        - [-1, 1, RepC3_CAB, [256, 3]]  # [c2, n]
+        
+        # 或指定注意力头数
+        - [-1, 1, RepC3_CAB, [256, 3, 4]]  # [c2, n, num_heads]
     """
     
-    def __init__(self, c1, c2, n=1, wt_type='haar', num_heads=4, e=0.5):
+    def __init__(self, c1, c2, n=3, num_heads=4, e=1.0):
         super().__init__()
+        c_ = int(c2 * e)  # hidden channels
         
-        # 输入通道对齐（如果Concat后通道数!=c2）
-        if c1 != c2:
-            self.input_proj = ConvNormLayer(c1, c2, 1, 1, act='silu')
-        else:
-            self.input_proj = nn.Identity()
+        # 输入分支
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
         
-        # 核心门控融合模块
-        self.gated_fusion = GatedInteractiveFusion_ResNet18(
-            channels=c2,
-            wt_type=wt_type,
-            num_heads=num_heads
-        )
+        # CAB模块序列
+        self.m = nn.ModuleList([
+            CAB_Block(c_, num_heads=num_heads) 
+            for _ in range(n)
+        ])
         
-        # 如果n>1，堆叠多个融合块
-        if n > 1:
-            self.extra_blocks = nn.ModuleList([
-                GatedInteractiveFusion_ResNet18(
-                    channels=c2,
-                    wt_type=wt_type,
-                    num_heads=num_heads
-                ) for _ in range(n - 1)
-            ])
-        else:
-            self.extra_blocks = None
+        # 输出融合
+        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
     
     def forward(self, x):
         """
         前向传播
         
-        Args:
-            x: 输入特征 [B, C1, H, W]
-        
-        Returns:
-            输出特征 [B, C2, H, W]
+        流程:
+        1. 输入x分为两个分支
+        2. cv1分支通过CAB模块处理
+        3. cv2分支保持不变
+        4. 两分支相加后输出
         """
-        # 通道对齐
-        x = self.input_proj(x)
+        # 两个分支
+        x1 = self.cv1(x)  # 处理分支
+        x2 = self.cv2(x)  # 残差分支
         
-        # 主融合块
-        x = self.gated_fusion(x)
+        # CAB处理（x1作为Q，x2作为K/V）
+        for cab in self.m:
+            x1 = cab(x1, x2)
         
-        # 额外的融合块（如果n>1）
-        if self.extra_blocks is not None:
-            for block in self.extra_blocks:
-                x = block(x)
-        
-        return x
+        # 融合
+        return self.cv3(x1 + x2)
 
 
-class GatedInteractiveFusion_ResNet18(nn.Module):
-    """
-    门控交互融合 - ResNet18优化版
-    
-    核心创新:
-    1. 快速Haar小波变换（无需pywt库）
-    2. 对比特征→小波子带门控
-    3. 小波特征→对比空间门控
-    4. 全局自适应融合权重
-    
-    工作流程:
-    输入x → 小波分解(LL/LH/HL/HH) → 门控增强
-          ↘ 对比特征提取 → 空间门控 ↗
-                      ↓
-                全局融合 + 残差连接
-    """
-    
-    def __init__(self, channels, wt_type='haar', num_heads=4):
+class CAB_Block(nn.Module):
+    """CAB模块的Block包装，添加残差连接"""
+    def __init__(self, c, num_heads=4):
         super().__init__()
-        
-        self.channels = channels
-        self.use_simple_wavelet = (wt_type == 'haar')
-        
-        # 如果用标准小波（db1等），需要创建滤波器
-        if not self.use_simple_wavelet:
-            try:
-                import pywt
-                w = pywt.Wavelet(wt_type)
-                
-                # 分解滤波器
-                dec_hi = torch.tensor(w.dec_hi[::-1], dtype=torch.float)
-                dec_lo = torch.tensor(w.dec_lo[::-1], dtype=torch.float)
-                dec_filters = torch.stack([
-                    dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1),  # LL
-                    dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1),  # LH
-                    dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1),  # HL
-                    dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)   # HH
-                ], dim=0)
-                self.wt_filter = nn.Parameter(
-                    dec_filters[:, None].repeat(channels, 1, 1, 1),
-                    requires_grad=False
-                )
-                
-                # 重建滤波器
-                rec_hi = torch.tensor(w.rec_hi, dtype=torch.float)
-                rec_lo = torch.tensor(w.rec_lo, dtype=torch.float)
-                rec_filters = torch.stack([
-                    rec_lo.unsqueeze(0) * rec_lo.unsqueeze(1),
-                    rec_lo.unsqueeze(0) * rec_hi.unsqueeze(1),
-                    rec_hi.unsqueeze(0) * rec_lo.unsqueeze(1),
-                    rec_hi.unsqueeze(0) * rec_hi.unsqueeze(1)
-                ], dim=0)
-                self.iwt_filter = nn.Parameter(
-                    rec_filters[:, None].repeat(channels, 1, 1, 1),
-                    requires_grad=False
-                )
-            except ImportError:
-                print("Warning: pywt not found, fallback to haar")
-                self.use_simple_wavelet = True
-        
-        # 小波域处理（处理4个子带）
-        self.wt_process = nn.Sequential(
-            nn.Conv2d(channels * 4, channels * 4, 3, padding=1, 
-                     groups=channels, bias=False),  # 深度卷积
-            nn.BatchNorm2d(channels * 4),
-            nn.SiLU()
-        )
-        
-        # 对比特征提取
-        self.contrast_extract = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, 
-                     groups=channels, bias=False),  # 深度卷积
-            nn.BatchNorm2d(channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 1, bias=False),  # 点卷积
-            nn.BatchNorm2d(channels)
-        )
-        
-        # 门控网络1: 对比 → 小波子带门控
-        # 输出[B, 4, 1, 1]控制4个小波子带的权重
-        self.contrast2wt_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, 4, 1),
-            nn.Sigmoid()
-        )
-        
-        # 门控网络2: 小波 → 对比空间门控
-        # 输出[B, C, 1, 1]或[B, C, H, W]控制对比特征的空间权重
-        self.wt2contrast_gate = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.BatchNorm2d(channels // 4),
-            nn.SiLU(),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # 全局融合门控: 学习小波和对比特征的最优混合比例
-        self.global_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels * 2, 2, 1),
-            nn.Softmax(dim=1)
-        )
-        
-        # 输出精炼
-        self.refine = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels)
-        )
+        self.cab = CAB(c, num_heads, bias=False)
+        self.norm = nn.BatchNorm2d(c)
     
-    def simple_haar_wavelet(self, x):
-        """
-        快速Haar小波变换（无需pywt库）
-        
-        Haar小波 = 简单的平均和差分:
-        - LL (低频): (x00 + x01 + x10 + x11) / 2
-        - LH (水平高频): (x00 + x01 - x10 - x11) / 2
-        - HL (垂直高频): (x00 - x01 + x10 - x11) / 2
-        - HH (对角高频): (x00 - x01 - x10 + x11) / 2
-        
-        Args:
-            x: [B, C, H, W]
-        
-        Returns:
-            [B, C, 4, H/2, W/2] - 4个子带
-        """
-        B, C, H, W = x.shape
-        
-        # 2x2块的4个位置
-        x_00 = x[:, :, 0::2, 0::2]  # 左上
-        x_01 = x[:, :, 0::2, 1::2]  # 右上
-        x_10 = x[:, :, 1::2, 0::2]  # 左下
-        x_11 = x[:, :, 1::2, 1::2]  # 右下
-        
-        # 计算4个子带
-        x_ll = (x_00 + x_01 + x_10 + x_11) / 2  # 低频（近似）
-        x_lh = (x_00 + x_01 - x_10 - x_11) / 2  # 水平细节
-        x_hl = (x_00 - x_01 + x_10 - x_11) / 2  # 垂直细节
-        x_hh = (x_00 - x_01 - x_10 + x_11) / 2  # 对角细节
-        
-        return torch.stack([x_ll, x_lh, x_hl, x_hh], dim=2)
-    
-    def simple_haar_inverse(self, x_wt):
-        """
-        快速Haar逆变换
-        
-        Args:
-            x_wt: [B, C, 4, H/2, W/2]
-        
-        Returns:
-            [B, C, H, W]
-        """
-        x_ll, x_lh, x_hl, x_hh = x_wt[:, :, 0], x_wt[:, :, 1], x_wt[:, :, 2], x_wt[:, :, 3]
-        
-        # 重建4个位置
-        x_00 = x_ll + x_lh + x_hl + x_hh
-        x_01 = x_ll + x_lh - x_hl - x_hh
-        x_10 = x_ll - x_lh + x_hl - x_hh
-        x_11 = x_ll - x_lh - x_hl + x_hh
-        
-        # 拼接回原始分辨率
-        B, C, H, W = x_ll.shape
-        x_recon = torch.zeros(B, C, H*2, W*2, device=x_ll.device, dtype=x_ll.dtype)
-        x_recon[:, :, 0::2, 0::2] = x_00
-        x_recon[:, :, 0::2, 1::2] = x_01
-        x_recon[:, :, 1::2, 0::2] = x_10
-        x_recon[:, :, 1::2, 1::2] = x_11
-        
-        return x_recon / 2
-    
-    def forward(self, x):
-        """
-        前向传播
-        
-        Args:
-            x: [B, C, H, W]
-        
-        Returns:
-            [B, C, H, W]
-        """
-        B, C, H, W = x.shape
-        
-        # 处理奇数尺寸（小波变换需要偶数）
-        pad_h = H % 2
-        pad_w = W % 2
-        if pad_h or pad_w:
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
-        else:
-            x_padded = x
-        
-        # ========== 小波分支 ==========
-        if self.use_simple_wavelet:
-            # 快速Haar变换
-            x_wt = self.simple_haar_wavelet(x_padded)
-        else:
-            # 标准小波变换（db1等）
-            x_wt = F.conv2d(x_padded, self.wt_filter, stride=2, 
-                           groups=C, padding=self.wt_filter.shape[2]//2-1)
-            x_wt = x_wt.reshape(B, C, 4, x_wt.shape[-2], x_wt.shape[-1])
-        
-        # 小波域处理
-        B_wt, C_wt, _, H_wt, W_wt = x_wt.shape
-        x_wt_flat = x_wt.reshape(B, C * 4, H_wt, W_wt)
-        x_wt_processed = self.wt_process(x_wt_flat)
-        
-        # ========== 对比分支 ==========
-        x_contrast = self.contrast_extract(x)
-        
-        # ========== 门控交互 ==========
-        # 1. 对比 → 小波子带门控
-        # 对比特征生成4个权重，控制LL/LH/HL/HH的重要性
-        subband_gates = self.contrast2wt_gate(x_contrast)  # [B, 4, 1, 1]
-        subband_gates = subband_gates.unsqueeze(2).expand(B, C, 4, 1, 1)
-        
-        x_wt_reshaped = x_wt_processed.reshape(B, C, 4, H_wt, W_wt)
-        x_wt_gated = x_wt_reshaped * subband_gates
-        
-        # 逆变换回空间域
-        if self.use_simple_wavelet:
-            x_wt_recon = self.simple_haar_inverse(x_wt_gated)
-        else:
-            x_wt_gated_flat = x_wt_gated.reshape(B, C * 4, H_wt, W_wt)
-            x_wt_recon = F.conv_transpose2d(
-                x_wt_gated_flat, self.iwt_filter, stride=2,
-                groups=C, padding=self.iwt_filter.shape[2]//2-1
-            )
-        
-        # 去除padding
-        x_wt_recon = x_wt_recon[:, :, :H, :W]
-        
-        # 2. 小波 → 对比空间门控
-        # 小波重建特征生成空间权重，控制对比特征的激活位置
-        contrast_gate = self.wt2contrast_gate(x_wt_recon)
-        x_contrast_gated = x_contrast * contrast_gate
-        
-        # ========== 全局融合 ==========
-        # 学习两个分支的最优混合比例
-        fusion_input = torch.cat([x_wt_recon, x_contrast_gated], dim=1)
-        global_weights = self.global_gate(fusion_input)  # [B, 2, 1, 1]
-        
-        x_fused = (global_weights[:, 0:1] * x_wt_recon + 
-                   global_weights[:, 1:2] * x_contrast_gated)
-        
-        # 精炼和残差连接
-        out = self.refine(x_fused)
-        out = out + x  # 残差连接，保持梯度流动
-        
-        return out
-
-class ConvNormLayer(nn.Module):
-    """基础卷积-归一化层"""
-    def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act='silu'):
-        super().__init__()
-        if padding is None:
-            padding = (kernel_size - 1) // 2
-        self.conv = nn.Conv2d(ch_in, ch_out, kernel_size, stride, padding, bias=bias)
-        self.norm = nn.BatchNorm2d(ch_out)
-        if act == 'silu':
-            self.act = nn.SiLU(inplace=True)
-        elif act == 'relu':
-            self.act = nn.ReLU(inplace=True)
-        else:
-            self.act = nn.Identity()
-
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
-class DepthwiseSeparableConv(nn.Module):
-    """深度可分离卷积（大幅减少参数）"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super().__init__()
-        # 深度卷积（每个通道独立卷积）
-        self.depthwise = nn.Conv2d(
-            in_channels, in_channels, 
-            kernel_size=kernel_size, 
-            stride=stride, 
-            padding=padding, 
-            groups=in_channels,  # 关键：groups=in_channels
-            bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        
-        # 点卷积（1x1卷积混合通道）
-        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.act = nn.SiLU(inplace=True)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.bn1(x)
-        x = self.act(x)
-        x = self.pointwise(x)
-        x = self.bn2(x)
-        return self.act(x)
+    def forward(self, x, y):
+        return x + self.norm(self.cab(x, y))
 
 
 # ============================================================================
-# 版本1: GatedFusion_Lite（轻度优化，参数减少30%）
+# 方案2: RepC3_CAB_Hybrid - RepConv + CAB混合
 # ============================================================================
 
-class GatedFusion_Lite(nn.Module):
+class RepC3_CAB_Hybrid(nn.Module):
     """
-    轻度优化版本 - 参数减少约30%
+    RepC3 CAB 混合版本
     
-    优化策略：
-    1. 使用深度可分离卷积替代部分标准卷积
-    2. 减少精炼模块的复杂度
-    3. 简化门控网络
+    特点:
+    - 结合RepConv的高效性和CAB的注意力
+    - 先用RepConv提取特征，再用CAB增强
+    - 平衡性能和效率
     
-    性能预期：
-    - 参数量：原版100% → 70%
-    - APs提升：+3.5% → +3.0%
-    - 推理速度：更快约15%
+    结构:
+    - 奇数层: RepConv（快速特征提取）
+    - 偶数层: CAB（注意力增强）
+    - 交替使用，兼顾效率和性能
     
-    适用场景：
-    - 中等计算资源
-    - 需要平衡性能和效率
-    - 推荐作为默认选择
+    参数:
+    - c1: 输入通道
+    - c2: 输出通道
+    - n: 总模块数
+    - num_heads: CAB的注意力头数
+    - e: expansion ratio
+    
+    性能预期:
+    - APs提升: +1.5~2.0%
+    - 参数增加: ~10%
+    - 速度: 略慢3-5%
+    
+    YAML使用:
+        - [-1, 1, RepC3_CAB_Hybrid, [256, 4]]  # [c2, n]
     """
     
-    def __init__(self, c1, c2, n=1, wt_type='haar', num_heads=4, e=0.5):
+    def __init__(self, c1, c2, n=4, num_heads=4, e=1.0):
         super().__init__()
+        c_ = int(c2 * e)
         
-        # 输入对齐
-        if c1 != c2:
-            self.input_proj = ConvNormLayer(c1, c2, 1, 1, act='silu')
-        else:
-            self.input_proj = nn.Identity()
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
         
-        # 核心融合
-        self.gated_fusion = GatedInteractiveFusion_Lite(c2, wt_type, num_heads)
+        # 交替使用RepConv和CAB
+        self.m = nn.ModuleList()
+        for i in range(n):
+            if i % 2 == 0:
+                # 偶数层：RepConv
+                self.m.append(RepConv(c_, c_))
+            else:
+                # 奇数层：CAB
+                self.m.append(CAB_Block(c_, num_heads))
         
-        # 多层堆叠（如果n>1）
-        if n > 1:
-            self.extra_blocks = nn.ModuleList([
-                GatedInteractiveFusion_Lite(c2, wt_type, num_heads)
-                for _ in range(n - 1)
-            ])
-        else:
-            self.extra_blocks = None
+        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
     
     def forward(self, x):
-        x = self.input_proj(x)
-        x = self.gated_fusion(x)
-        if self.extra_blocks:
-            for block in self.extra_blocks:
-                x = block(x)
-        return x
-
-
-class GatedInteractiveFusion_Lite(nn.Module):
-    """轻度优化的门控交互融合"""
-    
-    def __init__(self, channels, wt_type='haar', num_heads=4):
-        super().__init__()
-        self.channels = channels
-        self.use_simple_wavelet = (wt_type == 'haar')
+        x1 = self.cv1(x)
+        x2 = self.cv2(x)
         
-        # ========== 优化1: 小波处理用深度可分离卷积 ==========
-        self.wt_process = nn.Sequential(
-            # 深度卷积（参数：C*4 * 9）
-            nn.Conv2d(channels * 4, channels * 4, 3, padding=1, 
-                     groups=channels * 4, bias=False),
-            nn.BatchNorm2d(channels * 4),
-            nn.SiLU(inplace=True),
-            # 点卷积降维（参数：C*4 * C*4）
-            nn.Conv2d(channels * 4, channels * 4, 1, bias=False),
-            nn.BatchNorm2d(channels * 4)
-        )
+        # 交替处理
+        for i, module in enumerate(self.m):
+            if i % 2 == 0:
+                # RepConv: 单输入
+                x1 = module(x1)
+            else:
+                # CAB: 双输入
+                x1 = module(x1, x2)
         
-        # ========== 优化2: 对比特征用深度可分离卷积 ==========
-        self.contrast_extract = DepthwiseSeparableConv(channels, channels, 3, 1, 1)
-        
-        # ========== 门控网络（保持不变，参数本来就少）==========
-        self.contrast2wt_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, 4, 1),
-            nn.Sigmoid()
-        )
-        
-        self.wt2contrast_gate = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.BatchNorm2d(channels // 4),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        self.global_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels * 2, 2, 1),
-            nn.Softmax(dim=1)
-        )
-        
-        # ========== 优化3: 简化精炼模块 ==========
-        # 原版：两层3x3卷积
-        # 优化：一层深度可分离卷积
-        self.refine = DepthwiseSeparableConv(channels, channels, 3, 1, 1)
-    
-    def simple_haar_wavelet(self, x):
-        """快速Haar小波变换"""
-        B, C, H, W = x.shape
-        x_00 = x[:, :, 0::2, 0::2]
-        x_01 = x[:, :, 0::2, 1::2]
-        x_10 = x[:, :, 1::2, 0::2]
-        x_11 = x[:, :, 1::2, 1::2]
-        
-        x_ll = (x_00 + x_01 + x_10 + x_11) / 2
-        x_lh = (x_00 + x_01 - x_10 - x_11) / 2
-        x_hl = (x_00 - x_01 + x_10 - x_11) / 2
-        x_hh = (x_00 - x_01 - x_10 + x_11) / 2
-        
-        return torch.stack([x_ll, x_lh, x_hl, x_hh], dim=2)
-    
-    def simple_haar_inverse(self, x_wt):
-        """快速Haar逆变换"""
-        x_ll, x_lh, x_hl, x_hh = x_wt[:, :, 0], x_wt[:, :, 1], x_wt[:, :, 2], x_wt[:, :, 3]
-        
-        x_00 = x_ll + x_lh + x_hl + x_hh
-        x_01 = x_ll + x_lh - x_hl - x_hh
-        x_10 = x_ll - x_lh + x_hl - x_hh
-        x_11 = x_ll - x_lh - x_hl + x_hh
-        
-        B, C, H, W = x_ll.shape
-        x_recon = torch.zeros(B, C, H*2, W*2, device=x_ll.device, dtype=x_ll.dtype)
-        x_recon[:, :, 0::2, 0::2] = x_00
-        x_recon[:, :, 0::2, 1::2] = x_01
-        x_recon[:, :, 1::2, 0::2] = x_10
-        x_recon[:, :, 1::2, 1::2] = x_11
-        
-        return x_recon / 2
-    
-    def forward(self, x):
-        B, C, H, W = x.shape
-        
-        # 处理奇数尺寸
-        pad_h = H % 2
-        pad_w = W % 2
-        if pad_h or pad_w:
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
-        else:
-            x_padded = x
-        
-        # 小波分支
-        x_wt = self.simple_haar_wavelet(x_padded)
-        B_wt, C_wt, _, H_wt, W_wt = x_wt.shape
-        x_wt_flat = x_wt.reshape(B, C * 4, H_wt, W_wt)
-        x_wt_processed = self.wt_process(x_wt_flat)
-        
-        # 对比分支
-        x_contrast = self.contrast_extract(x)
-        
-        # 门控交互
-        subband_gates = self.contrast2wt_gate(x_contrast)
-        subband_gates = subband_gates.unsqueeze(2).expand(B, C, 4, 1, 1)
-        
-        x_wt_reshaped = x_wt_processed.reshape(B, C, 4, H_wt, W_wt)
-        x_wt_gated = x_wt_reshaped * subband_gates
-        
-        x_wt_recon = self.simple_haar_inverse(x_wt_gated)
-        x_wt_recon = x_wt_recon[:, :, :H, :W]
-        
-        contrast_gate = self.wt2contrast_gate(x_wt_recon)
-        x_contrast_gated = x_contrast * contrast_gate
-        
-        # 全局融合
-        fusion_input = torch.cat([x_wt_recon, x_contrast_gated], dim=1)
-        global_weights = self.global_gate(fusion_input)
-        
-        x_fused = (global_weights[:, 0:1] * x_wt_recon + 
-                   global_weights[:, 1:2] * x_contrast_gated)
-        
-        # 精炼和残差
-        out = self.refine(x_fused)
-        out = out + x
-        
-        return out
+        return self.cv3(x1 + x2)
 
 
 # ============================================================================
-# 版本2: GatedFusion_Tiny（中度优化，参数减少50%）
+# 方案3: RepC3_CAB_Lite - 轻量级版本
 # ============================================================================
 
-class GatedFusion_Tiny(nn.Module):
+class RepC3_CAB_Lite(nn.Module):
     """
-    中度优化版本 - 参数减少约50%
+    RepC3 CAB 轻量级版本
     
-    优化策略：
-    1. 压缩中间通道数（使用expansion ratio）
-    2. 移除一个门控分支
-    3. 共享部分参数
-    4. 极简精炼模块
+    特点:
+    - 减少注意力头数
+    - 使用更简单的CAB_Lite
+    - 适合资源受限场景
     
-    性能预期：
-    - 参数量：原版100% → 50%
-    - APs提升：+3.5% → +2.5%
-    - 推理速度：更快约30%
+    优化:
+    - 单头注意力（num_heads=1）
+    - 移除temperature参数
+    - 简化投影层
     
-    适用场景：
-    - 边缘设备
-    - 实时性要求高
-    - 参数预算紧张
+    参数:
+    - c1: 输入通道
+    - c2: 输出通道
+    - n: 模块数量
+    - e: expansion ratio
+    
+    性能预期:
+    - APs提升: +1.0~1.5%
+    - 参数增加: ~5%
+    - 速度: 几乎不变
+    
+    YAML使用:
+        - [-1, 1, RepC3_CAB_Lite, [256, 3]]
     """
     
-    def __init__(self, c1, c2, n=1, wt_type='haar', num_heads=4, e=0.5):
+    def __init__(self, c1, c2, n=3, e=1.0):
         super().__init__()
+        c_ = int(c2 * e)
         
-        if c1 != c2:
-            self.input_proj = ConvNormLayer(c1, c2, 1, 1, act='silu')
-        else:
-            self.input_proj = nn.Identity()
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
         
-        self.gated_fusion = GatedInteractiveFusion_Tiny(c2, wt_type, num_heads)
+        # 轻量级CAB
+        self.m = nn.ModuleList([
+            CAB_Lite(c_) for _ in range(n)
+        ])
         
-        if n > 1:
-            self.extra_blocks = nn.ModuleList([
-                GatedInteractiveFusion_Tiny(c2, wt_type, num_heads)
-                for _ in range(n - 1)
-            ])
-        else:
-            self.extra_blocks = None
+        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
     
     def forward(self, x):
-        x = self.input_proj(x)
-        x = self.gated_fusion(x)
-        if self.extra_blocks:
-            for block in self.extra_blocks:
-                x = block(x)
-        return x
+        x1 = self.cv1(x)
+        x2 = self.cv2(x)
+        
+        for cab in self.m:
+            x1 = cab(x1, x2)
+        
+        return self.cv3(x1 + x2)
 
 
-class GatedInteractiveFusion_Tiny(nn.Module):
-    """中度优化的门控交互融合"""
-    
-    def __init__(self, channels, wt_type='haar', num_heads=4, expansion=0.5):
+class CAB_Lite(nn.Module):
+    """轻量级CAB - 单头，无temperature"""
+    def __init__(self, dim):
         super().__init__()
-        self.channels = channels
-        self.use_simple_wavelet = (wt_type == 'haar')
         
-        # ========== 优化1: 压缩中间通道数 ==========
-        hidden_channels = int(channels * expansion)  # 减少50%通道
+        # 简化的Q/K/V生成
+        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
+        self.dwconv = nn.Conv2d(dim * 3, dim * 3, 3, 1, 1, groups=dim * 3, bias=False)
         
-        # 输入降维
-        self.input_compress = nn.Conv2d(channels, hidden_channels, 1, bias=False)
-        
-        # 小波处理（在压缩空间）
-        self.wt_process = nn.Sequential(
-            nn.Conv2d(hidden_channels * 4, hidden_channels * 4, 3, 
-                     padding=1, groups=hidden_channels * 4, bias=False),
-            nn.BatchNorm2d(hidden_channels * 4),
-            nn.SiLU(inplace=True)
-        )
-        
-        # 对比特征（在压缩空间）
-        self.contrast_extract = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, 3, 
-                     padding=1, groups=hidden_channels, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.SiLU(inplace=True)
-        )
-        
-        # ========== 优化2: 简化门控（只保留关键的）==========
-        # 移除 wt2contrast_gate，只保留 contrast2wt_gate
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(hidden_channels, 4, 1),  # 只控制小波子带
-            nn.Sigmoid()
-        )
-        
-        # 输出恢复
-        self.output_expand = nn.Conv2d(hidden_channels, channels, 1, bias=False)
+        self.project_out = nn.Conv2d(dim, dim, 1, bias=False)
     
-    def simple_haar_wavelet(self, x):
-        """快速Haar小波变换"""
-        B, C, H, W = x.shape
-        x_00 = x[:, :, 0::2, 0::2]
-        x_01 = x[:, :, 0::2, 1::2]
-        x_10 = x[:, :, 1::2, 0::2]
-        x_11 = x[:, :, 1::2, 1::2]
+    def forward(self, x, y):
+        b, c, h, w = x.shape
         
-        x_ll = (x_00 + x_01 + x_10 + x_11) / 2
-        x_lh = (x_00 + x_01 - x_10 - x_11) / 2
-        x_hl = (x_00 - x_01 + x_10 - x_11) / 2
-        x_hh = (x_00 - x_01 - x_10 + x_11) / 2
+        # 从x生成Q，从y生成K/V
+        q = self.dwconv(self.qkv(x))[:, :c]
+        kv = self.dwconv(self.qkv(y))[:, c:]
+        k, v = kv.chunk(2, dim=1)
         
-        return torch.stack([x_ll, x_lh, x_hl, x_hh], dim=2)
-    
-    def simple_haar_inverse(self, x_wt):
-        """快速Haar逆变换"""
-        x_ll, x_lh, x_hl, x_hh = x_wt[:, :, 0], x_wt[:, :, 1], x_wt[:, :, 2], x_wt[:, :, 3]
+        # 简化为单头
+        q = rearrange(q, 'b c h w -> b c (h w)')
+        k = rearrange(k, 'b c h w -> b c (h w)')
+        v = rearrange(v, 'b c h w -> b c (h w)')
         
-        x_00 = x_ll + x_lh + x_hl + x_hh
-        x_01 = x_ll + x_lh - x_hl - x_hh
-        x_10 = x_ll - x_lh + x_hl - x_hh
-        x_11 = x_ll - x_lh - x_hl + x_hh
+        # 归一化
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
         
-        B, C, H, W = x_ll.shape
-        x_recon = torch.zeros(B, C, H*2, W*2, device=x_ll.device, dtype=x_ll.dtype)
-        x_recon[:, :, 0::2, 0::2] = x_00
-        x_recon[:, :, 0::2, 1::2] = x_01
-        x_recon[:, :, 1::2, 0::2] = x_10
-        x_recon[:, :, 1::2, 1::2] = x_11
+        # 注意力
+        attn = (q @ k.transpose(-2, -1))
+        attn = F.softmax(attn, dim=-1)
         
-        return x_recon / 2
-    
-    def forward(self, x):
-        B, C, H, W = x.shape
-        identity = x
+        # 输出
+        out = attn @ v
+        out = rearrange(out, 'b c (h w) -> b c h w', h=h, w=w)
+        out = self.project_out(out)
         
-        # ========== 在压缩空间处理 ==========
-        x = self.input_compress(x)
-        C_hidden = x.shape[1]
-        
-        # 处理奇数尺寸
-        pad_h = H % 2
-        pad_w = W % 2
-        if pad_h or pad_w:
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
-        else:
-            x_padded = x
-        
-        # 小波分支
-        x_wt = self.simple_haar_wavelet(x_padded)
-        B_wt, C_wt, _, H_wt, W_wt = x_wt.shape
-        x_wt_flat = x_wt.reshape(B, C_hidden * 4, H_wt, W_wt)
-        x_wt_processed = self.wt_process(x_wt_flat)
-        
-        # 对比分支
-        x_contrast = self.contrast_extract(x)
-        
-        # ========== 简化门控：只用对比控制小波 ==========
-        gates = self.gate(x_contrast)  # [B, 4, 1, 1]
-        gates = gates.unsqueeze(1).expand(B, C_hidden, 4, 1, 1)
-        
-        x_wt_reshaped = x_wt_processed.reshape(B, C_hidden, 4, H_wt, W_wt)
-        x_wt_gated = x_wt_reshaped * gates
-        
-        x_wt_recon = self.simple_haar_inverse(x_wt_gated)
-        x_wt_recon = x_wt_recon[:, :, :H, :W]
-        
-        # 简单相加融合（不用复杂的global gate）
-        x_fused = x_wt_recon + x_contrast
-        
-        # 恢复到原始通道数
-        out = self.output_expand(x_fused)
-        out = out + identity
-        
-        return out
+        return x + out  # 残差连接
 
 
 # ============================================================================
-# 版本3: GatedFusion_Micro（极致轻量，参数减少70%）
+# 辅助模块
 # ============================================================================
 
-class GatedFusion_Micro(nn.Module):
-    """
-    极致轻量版本 - 参数减少约70%
-    
-    优化策略：
-    1. 最小化中间通道数（expansion=0.25）
-    2. 移除所有门控，改用简单加权
-    3. 共享小波和对比处理
-    4. 无精炼模块
-    
-    性能预期：
-    - 参数量：原版100% → 30%
-    - APs提升：+3.5% → +1.5~2.0%
-    - 推理速度：更快约50%
-    
-    适用场景：
-    - 极度资源受限
-    - 移动端/嵌入式设备
-    - 需要极快推理速度
-    - 可以接受性能轻微下降
-    """
-    
-    def __init__(self, c1, c2, n=1, wt_type='haar', num_heads=4, e=0.5):
+class Conv(nn.Module):
+    """标准卷积 + BN + 激活"""
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
         super().__init__()
-        
-        if c1 != c2:
-            # 使用深度可分离卷积对齐
-            self.input_proj = DepthwiseSeparableConv(c1, c2, 1, 1, 0)
-        else:
-            self.input_proj = nn.Identity()
-        
-        self.gated_fusion = GatedInteractiveFusion_Micro(c2, wt_type)
-        
-        if n > 1:
-            self.extra_blocks = nn.ModuleList([
-                GatedInteractiveFusion_Micro(c2, wt_type)
-                for _ in range(n - 1)
-            ])
-        else:
-            self.extra_blocks = None
+        if p is None:
+            p = k // 2
+        self.conv = nn.Conv2d(c1, c2, k, s, p, groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
     
     def forward(self, x):
-        x = self.input_proj(x)
-        x = self.gated_fusion(x)
-        if self.extra_blocks:
-            for block in self.extra_blocks:
-                x = block(x)
-        return x
+        return self.act(self.bn(self.conv(x)))
 
 
-class GatedInteractiveFusion_Micro(nn.Module):
-    """极致轻量的门控交互融合"""
-    
-    def __init__(self, channels, wt_type='haar', expansion=0.25):
+class RepConv(nn.Module):
+    """RepVGG风格的卷积（简化版）"""
+    def __init__(self, c1, c2, k=3, s=1):
         super().__init__()
-        self.channels = channels
-        
-        # ========== 优化1: 极小的中间通道数 ==========
-        hidden_channels = max(int(channels * expansion), 16)  # 至少16通道
-        
-        # 输入降维（深度可分离）
-        self.compress = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Conv2d(channels, hidden_channels, 1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.SiLU(inplace=True)
-        )
-        
-        # ========== 优化2: 共享处理（小波和对比共用）==========
-        self.shared_process = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, 3, 
-                     padding=1, groups=hidden_channels, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.SiLU(inplace=True)
-        )
-        
-        # ========== 优化3: 极简融合（可学习权重）==========
-        self.fusion_weight = nn.Parameter(torch.tensor([0.5, 0.5]))
-        
-        # 输出恢复（深度可分离）
-        self.expand = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, 3, 
-                     padding=1, groups=hidden_channels, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.Conv2d(hidden_channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels)
-        )
-    
-    def simple_haar_wavelet(self, x):
-        """快速Haar小波变换（只保留LL和HH）"""
-        B, C, H, W = x.shape
-        x_00 = x[:, :, 0::2, 0::2]
-        x_01 = x[:, :, 0::2, 1::2]
-        x_10 = x[:, :, 1::2, 0::2]
-        x_11 = x[:, :, 1::2, 1::2]
-        
-        # 只保留低频和高频对角
-        x_ll = (x_00 + x_01 + x_10 + x_11) / 2  # 低频
-        x_hh = (x_00 - x_01 - x_10 + x_11) / 2  # 对角高频
-        
-        return x_ll, x_hh
-    
-    def simple_haar_inverse_simplified(self, x_ll, x_hh):
-        """简化的Haar逆变换"""
-        x_00 = x_ll + x_hh
-        x_01 = x_ll - x_hh
-        x_10 = x_ll - x_hh
-        x_11 = x_ll + x_hh
-        
-        B, C, H, W = x_ll.shape
-        x_recon = torch.zeros(B, C, H*2, W*2, device=x_ll.device, dtype=x_ll.dtype)
-        x_recon[:, :, 0::2, 0::2] = x_00
-        x_recon[:, :, 0::2, 1::2] = x_01
-        x_recon[:, :, 1::2, 0::2] = x_10
-        x_recon[:, :, 1::2, 1::2] = x_11
-        
-        return x_recon / 2
-    
+        self.conv1 = Conv(c1, c2, k, s)
+        self.conv2 = Conv(c1, c2, 1, s)
+
     def forward(self, x):
-        B, C, H, W = x.shape
-        identity = x
-        
-        # 降维到压缩空间
-        x = self.compress(x)
-        
-        # 处理奇数尺寸
-        pad_h = H % 2
-        pad_w = W % 2
-        if pad_h or pad_w:
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
-        else:
-            x_padded = x
-        
-        # ========== 简化小波：只用LL和HH ==========
-        x_ll, x_hh = self.simple_haar_wavelet(x_padded)
-        x_wt = self.shared_process(x_ll + x_hh)  # 合并处理
-        
-        # ========== 对比特征 ==========
-        x_contrast = self.shared_process(x)
-        
-        # ========== 极简融合：可学习加权 ==========
-        w = torch.softmax(self.fusion_weight, dim=0)
-        x_fused = w[0] * x_wt + w[1] * x_contrast
-        
-        # 恢复到原始空间
-        out = self.expand(x_fused)
-        out = out + identity
-        
-        return out
+        return self.conv1(x) + self.conv2(x)
