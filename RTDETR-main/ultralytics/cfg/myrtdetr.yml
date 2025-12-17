@@ -28,20 +28,20 @@ head:
   - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 12
   - [6, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 13 input_proj.1
   - [[-2, -1], 1, Concat, [1]] # 14
-  - [-1, 1, GatedFusion_Tiny, [512,256]]  # 15, fpn_blocks.0
+  - [-1, 1, RepC3_CAB, [256, 3]]  # 14, fpn_blocks.0
   - [-1, 1, Conv, [256, 1, 1]]   # 16, Y4, lateral_convs.1
 
   - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 17
   - [4, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 18 input_proj.0
   - [[-2, -1], 1, Concat, [1]]  # 19 cat backbone P4
-  - [-1, 1, GatedFusion_Tiny, [512,256]]    # X3 (20), fpn_blocks.1
+  - [-1, 1, RepC3_CAB, [256, 3]]  # 14, fpn_blocks.0
 
   - [-1, 1, Conv, [256, 3, 2]]   # 21, downsample_convs.0
   - [[-1, 16], 1, Concat, [1]]  # 22 cat Y4
-  - [-1, 1, GatedFusion_Tiny, [512,256]]   # F4 (23), pan_blocks.0
+  - [-1, 1, RepC3_CAB, [256, 3]]  # 14, fpn_blocks.0
 
   - [-1, 1, Conv, [256, 3, 2]]   # 24, downsample_convs.1
   - [[-1, 11], 1, Concat, [1]]  # 25 cat Y5
-  - [-1, 1, GatedFusion_Tiny, [512,256]]    # F5 (26), pan_blocks.1
+  - [-1, 1, RepC3_CAB, [256, 3]]  # 14, fpn_blocks.0
 
   - [[20, 23, 26], 1, RTDETRDecoder, [nc, 256, 300, 4, 8, 3]]  # Detect(P3, P4, P5)
