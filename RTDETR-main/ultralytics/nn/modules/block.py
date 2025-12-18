@@ -1432,3 +1432,87 @@ class RepConv(nn.Module):
 
     def forward(self, x):
         return self.conv1(x) + self.conv2(x)
+
+
+
+class MSFM(nn.Module):
+    """
+    Multi-Scale Fusion Module - 多尺度融合模块
+    
+    YAML使用:
+        - [-1, 1, MSFM, [256, 3]]  # [c2, n]
+    """
+    
+    def __init__(self, c1, c2, n=3, e=1.0):
+        super().__init__()
+        c_ = int(c2 * e)
+        
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        
+        self.m = nn.ModuleList([
+            MSFMBlock(c_) for _ in range(n)
+        ])
+        
+        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
+    
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = self.cv2(x)
+        
+        for block in self.m:
+            x1 = block(x1)
+        
+        return self.cv3(x1 + x2)
+
+
+class MSFMBlock(nn.Module):
+    """多尺度融合基础块"""
+    def __init__(self, c):
+        super().__init__()
+        c_inter = c // 3
+        
+        # 3个不同膨胀率的分支
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(c, c_inter, 3, 1, padding=1, dilation=1, bias=False),
+            nn.BatchNorm2d(c_inter),
+            nn.SiLU()
+        )
+        
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(c, c_inter, 3, 1, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(c_inter),
+            nn.SiLU()
+        )
+        
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(c, c_inter, 3, 1, padding=3, dilation=3, bias=False),
+            nn.BatchNorm2d(c_inter),
+            nn.SiLU()
+        )
+        
+        # 通道注意力融合
+        self.fusion = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_inter * 3, c_inter * 3 // 4, 1),
+            nn.SiLU(),
+            nn.Conv2d(c_inter * 3 // 4, c_inter * 3, 1),
+            nn.Sigmoid()
+        )
+        
+        # 输出投影
+        self.project = Conv(c_inter * 3, c, 1, 1)
+    
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        
+        concat = torch.cat([b1, b2, b3], dim=1)
+        
+        attn = self.fusion(concat)
+        fused = concat * attn
+        
+        out = self.project(fused)
+        return x + out
+
