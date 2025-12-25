@@ -783,7 +783,7 @@ def parse_model(d, ch, verbose=True, warehouse_manager=None):  # model_dict, inp
                  C2f_PSFSConv, C2f_FasterSFSConv, C2f_GroupMamba, C2f_GroupMambaBlock, C2f_MambaVision, C2f_FourierConv, FourierConv, C2f_wConv, wConv2d,
                  C2f_GLVSS, C2f_ESC, C2f_MBRConv3, C2f_MBRConv5, MBRConv3C3, MBRConv5C3, C2f_VSSD, C2f_TVIM, C2f_CSI, C2f_SHSA_EPGO, C2f_SHSA_EPGO_CGLU, C2f_ConvAttn,
                  C2f_UniConvBlock, C2f_LGLB, C2f_ConverseB, C2f_Converse2D, Converse2DC3, Converse2D, RepStem, C2f_GCConv, GCConvC3, GCConv, C2f_CFBlock, C2f_FMABlock,
-                 C2f_LWGA, C2f_CSSC, C2f_CNCM, C2f_HFRB, C2f_EVA, C2f_RMBC, C2f_RMBC_LA):
+                 C2f_LWGA, C2f_CSSC, C2f_CNCM, C2f_HFRB, C2f_EVA, C2f_RMBC, C2f_RMBC_LA,SmallObjectEnhancementModule):
             if args[0] == 'head_channel':
                 args[0] = d[args[0]]
             c1, c2 = ch[f], args[0]
