@@ -14,7 +14,7 @@ from einops import rearrange
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ConvNormLayer', 'BasicBlock', 
-           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','BasicBlock_Hybrid_Full','RepC3_CAB')
+           'BottleNeck', 'Blocks','C2f_MambaOut_DSA','BasicBlock_Hybrid_Full','SmallObjectEnhancementModule')
 
 def autopad(k, p=None, d=1):
     """自动填充以保持输出尺寸"""
@@ -23,24 +23,6 @@ def autopad(k, p=None, d=1):
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
     return p
-
-
-class Conv(nn.Module):
-    """标准卷积层 + BN + 激活"""
-    default_act = nn.SiLU()
-
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
-        self.act = (
-            self.default_act if act is True
-            else act if isinstance(act, nn.Module)
-            else nn.Identity()
-        )
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
 
 
 # ============================================================================
@@ -170,55 +152,6 @@ class HybridBottleneck_Full(nn.Module):
         attention = self.fusion(combined)
         fused = combined * attention
         out = self.cv2(fused)
-        return x + out if self.add else out
-
-
-class HybridBottleneck_Lite(nn.Module):
-    """轻量版混合瓶颈块 - 选择性频域"""
-    def __init__(self, c1, c2, shortcut=True, kernel_size=7, expansion=0.5):
-        super().__init__()
-        c_ = int(c2 * expansion)
-        c_freq = c_ // 2
-        
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.gated_spatial = GatedSpatialUnit(c_, kernel_size=kernel_size, conv_ratio=0.5)
-        self.frequency = FrequencyUnit(c_freq, c_freq, kernel_size=(3, 3))
-        
-        self.freq_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c_freq, c_freq, 1),
-            nn.Sigmoid()
-        )
-        
-        self.cv2 = Conv(c_ + c_freq, c2, 1, 1)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        feat = self.cv1(x)
-        spatial_feat = self.gated_spatial(feat)
-        freq_input = feat[:, :feat.size(1)//2, :, :]
-        freq_feat = self.frequency(freq_input)
-        freq_feat = freq_feat * self.freq_gate(freq_feat)
-        combined = torch.cat([spatial_feat, freq_feat], dim=1)
-        out = self.cv2(combined)
-        return x + out if self.add else out
-
-
-class HybridBottleneck_Fast(nn.Module):
-    """快速版混合瓶颈块 - 仅门控"""
-    def __init__(self, c1, c2, shortcut=True, kernel_size=7, expansion=0.5):
-        super().__init__()
-        c_ = int(c2 * expansion)
-        
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.gated_spatial = GatedSpatialUnit(c_, kernel_size=kernel_size, conv_ratio=0.5)
-        self.cv2 = Conv(c_, c2, 1, 1)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        feat = self.cv1(x)
-        out = self.gated_spatial(feat)
-        out = self.cv2(out)
         return x + out if self.add else out
 
 
@@ -1105,414 +1038,383 @@ class Blocks(nn.Module):
             out = block(out)
         return out
 
-class CAB(nn.Module):
+
+
+
+
+
+
+
+
+class AHFF(nn.Module):
     """
-    Channel Attention Block - 跨特征注意力
-    
-    特点：
-    - Q来自x，K/V来自y
-    - 多头注意力机制
-    - 深度可分离卷积
+    Adaptive High-Frequency Fusion模块：自适应权重与高频增强
+    修复版 - 支持list输入
     """
-    def __init__(self, dim, num_heads, bias=False):
-        super(CAB, self).__init__()
-        self.num_heads = num_heads
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+    def __init__(self, channels, r=16, alpha=0.1, keep_dim=False):
+        super().__init__()
+        self.keep_dim = keep_dim
         
-        # Query分支
-        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
-        self.q_dwconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim, bias=bias)
+        # 通道注意力MLP
+        self.ca_mlp = nn.Sequential(
+            nn.Linear(channels * 2, channels * 2 // r),
+            nn.ReLU(),
+            nn.Linear(channels * 2 // r, channels * 2),
+            nn.Sigmoid()
+        )
         
-        # Key-Value分支
-        self.kv = nn.Conv2d(dim, dim*2, kernel_size=1, bias=bias)
-        self.kv_dwconv = nn.Conv2d(dim*2, dim*2, kernel_size=3, stride=1, padding=1, groups=dim*2, bias=bias)
+        # 空间注意力卷积
+        self.sa_conv = nn.Conv2d(2, 1, 7, padding=3)
         
-        # 输出投影
-        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        # 高通滤波参数
+        self.hpf_d0_alpha = alpha
+        
+        # 高频偏置融合卷积
+        self.bias_conv = nn.Conv2d(channels * 4, channels * 2, 1)
+        
+        # 可选的降维卷积
+        if keep_dim:
+            self.reduce_conv = nn.Conv2d(channels * 2, channels, 1)
     
-    def forward(self, x, y):
+    def forward(self, x):
         """
+        前向传播 - 修复版
+        
         Args:
-            x: Query特征 [B, C, H, W]
-            y: Key-Value特征 [B, C, H, W]
+            x: 可以是list[feat1, feat2]或单个tensor
+        
         Returns:
-            输出特征 [B, C, H, W]
+            融合后的特征
         """
-        b, c, h, w = x.shape
+        # ===== 关键修复：处理list输入 =====
+        if isinstance(x, list):
+            if len(x) != 2:
+                raise ValueError(f"AHFF expects 2 inputs, got {len(x)}")
+            feat1, feat2 = x[0], x[1]
+        else:
+            # 如果是单个tensor，尝试按通道分割
+            # 这种情况一般不会发生，但作为fallback
+            raise ValueError("AHFF requires 2 separate feature inputs")
         
-        # 生成Q, K, V
-        q = self.q_dwconv(self.q(x))
-        kv = self.kv_dwconv(self.kv(y))
-        k, v = kv.chunk(2, dim=1)
+        # 拼接特征
+        fused = torch.cat([feat1, feat2], dim=1)  # [B, 2C, H, W]
         
-        # 重排为多头
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        # === 通道-空间混合自适应权重 ===
+        # 通道注意力
+        gap = fused.mean(dim=(2, 3))  # GAP [B, 2C]
+        wc = self.ca_mlp(gap).unsqueeze(2).unsqueeze(3)  # [B, 2C, 1, 1]
         
-        # 归一化
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
+        # 空间注意力
+        avg_pool = fused.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        max_pool = fused.amax(dim=1, keepdim=True)
+        ws = torch.sigmoid(self.sa_conv(torch.cat([avg_pool, max_pool], dim=1)))  # [B, 1, H, W]
         
-        # 注意力计算
-        attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = F.softmax(attn, dim=-1)
+        # 混合权重
+        w = wc * ws.expand_as(fused)  # [B, 2C, H, W]
         
-        # 输出
-        out = (attn @ v)
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
-        out = self.project_out(out)
+        # 加权特征
+        weighted_feat1 = w[:, :feat1.shape[1]] * feat1
+        weighted_feat2 = w[:, feat1.shape[1]:] * feat2
+        fused_weighted = torch.cat([weighted_feat1, weighted_feat2], dim=1)
         
-        return out
+        # === 高频增强 ===
+        # 2D FFT
+        fft = torch.fft.fft2(fused_weighted)
+        shift = torch.fft.fftshift(fft)
+        
+        # 生成高通滤波器
+        b, c, h, w = fused_weighted.shape
+        y = torch.arange(h, device=fused.device).unsqueeze(1) - h / 2
+        x_coord = torch.arange(w, device=fused.device) - w / 2
+        D = torch.sqrt(y**2 + x_coord**2)
+        D = D.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        
+        # 高斯高通滤波核
+        D0 = self.hpf_d0_alpha * min(h, w)
+        H = 1 - torch.exp(-D**2 / (2 * D0**2))
+        
+        # 应用高通滤波
+        shift_hf = shift * H
+        ifft = torch.fft.ifft2(torch.fft.ifftshift(shift_hf))
+        fused_hf = torch.real(ifft)  # [B, 2C, H, W]
+        
+        # === 高频偏置融合 ===
+        bias = self.bias_conv(torch.cat([fused_weighted, fused_hf], dim=1))
+        output = fused_weighted + bias  # [B, 2C, H, W]
+        
+        # 可选降维
+        if self.keep_dim:
+            output = self.reduce_conv(output)  # [B, C, H, W]
+        
+        return output
 
 
-# ============================================================================
-# 方案1: RepC3_CAB - 用CAB替换RepConv (推荐) ⭐
-# ============================================================================
 
-class RepC3_CAB(nn.Module):
+class ECA(nn.Module):
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=k_size,
+            padding=(k_size - 1) // 2,
+            bias=False
+        )
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg(x).squeeze(-1).transpose(-1, -2)  # B,C → B,1,C
+        y = self.conv(y)
+        y = self.sig(y).transpose(-1, -2).unsqueeze(-1)
+        return x * y.expand_as(x)
+
+
+# ----------------------------
+# RepConvExt （YOLO 版）
+# ----------------------------
+class HybridBottleneck_Lite(nn.Module):
+    """轻量版混合瓶颈块 - 选择性频域 ⭐ 推荐"""
+    def __init__(self, c1, c2, shortcut=True, kernel_size=7, expansion=0.5):
+        super().__init__()
+        c_ = int(c2 * expansion)
+        c_freq = c_ // 2
+        
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.gated_spatial = GatedSpatialUnit(c_, kernel_size=kernel_size, conv_ratio=0.5)
+        self.frequency = FrequencyUnit(c_freq, c_freq, kernel_size=(3, 3))
+        
+        self.freq_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_freq, c_freq, 1),
+            nn.Sigmoid()
+        )
+        
+        self.cv2 = Conv(c_ + c_freq, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        feat = self.cv1(x)
+        spatial_feat = self.gated_spatial(feat)
+        freq_input = feat[:, :feat.size(1)//2, :, :]
+        freq_feat = self.frequency(freq_input)
+        freq_feat = freq_feat * self.freq_gate(freq_feat)
+        combined = torch.cat([spatial_feat, freq_feat], dim=1)
+        out = self.cv2(combined)
+        return x + out if self.add else out
+        
+class C2f_Hybrid_Lite(nn.Module):
     """
-    RepC3 with CAB - 用CAB替换RepConv
+    C2f with HybridBottleneck_Lite - 轻量版 ⭐ 推荐
     
     特点:
-    - 保持RepC3的CSP结构
-    - 用CAB替换RepConv，增强特征交互
-    - 适合需要强特征融合的场景
-    
-    改进:
-    - 原始RepC3用RepConv进行特征提取
-    - 现在用CAB进行跨分支注意力
-    - 性能提升，参数略增
-    
-    参数:
-    - c1: 输入通道
-    - c2: 输出通道
-    - n: CAB模块数量
-    - num_heads: 注意力头数
-    - e: expansion ratio
+    - 使用 HybridBottleneck_Lite 作为基础模块
+    - 选择性的频域处理
+    - 平衡精度和效率
+    - 适合大多数应用场景
     
     性能预期:
-    - APs提升: +2.0~2.5%
-    - 参数增加: ~15%
-    - 速度: 略慢5-10%
+    - mAP提升: +1.5~2.0%
+    - 参数增加: ~8%
+    - 速度: 略慢3-5%
     
     YAML使用:
-        # 替换原始RepC3
-        - [-1, 1, RepC3_CAB, [256, 3]]  # [c2, n]
+        - [-1, 3, C2f_Hybrid_Lite, [256, 0.5]]
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
         
-        # 或指定注意力头数
-        - [-1, 1, RepC3_CAB, [256, 3, 4]]  # [c2, n, num_heads]
+        self.m = nn.ModuleList(
+            HybridBottleneck_Lite(
+                self.c, 
+                self.c, 
+                shortcut=shortcut,
+                kernel_size=7,
+                expansion=1.0
+            ) for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
+class SmallObjectEnhancementModule(nn.Module):
+    """
+    小目标检测增强模块 - 精简版
+    
+    核心设计理念：
+    1. 频域高频增强 - 捕获小目标的边缘细节（最关键）
+    2. 局部细节注意力 - 聚焦小目标区域
+    3. 轻量级设计 - 最小化参数和计算开销
+    
+    不包含：
+    - 复杂的多尺度结构（增加计算但收益有限）
+    - 过深的网络层（容易过拟合）
+    - 冗余的注意力机制（通道注意力对小目标帮助不大）
     """
     
-    def __init__(self, c1, c2, n=3, num_heads=4, e=1.0):
-        super().__init__()
-        c_ = int(c2 * e)  # hidden channels
+    def __init__(self, c1, c2, freq_enhance_ratio=0.5):
+        """
+        Args:
+            c1: 输入通道数
+            c2: 输出通道数（通常与c1相同）
+            freq_enhance_ratio: 高频增强强度 (0.0-1.0)
+        """
+        super(SmallObjectEnhancementModule, self).__init__()
         
-        # 输入分支
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
+        self.c1 = c1
+        self.c2 = c2
+        self.channels = c2  # 保持兼容性
+        self.freq_enhance_ratio = freq_enhance_ratio
         
-        # CAB模块序列
-        self.m = nn.ModuleList([
-            CAB_Block(c_, num_heads=num_heads) 
-            for _ in range(n)
-        ])
+        # ============ 核心1: 频域高频滤波器 ============
+        # 这是最关键的部分 - 小目标的边缘信息主要在高频
+        self.freq_filter = nn.Parameter(
+            torch.ones(1, c2, 1, 1) * 0.5,  # 可学习的频率权重
+            requires_grad=True
+        )
         
-        # 输出融合
-        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
+        # 频域特征压缩（减少计算量）
+        self.freq_compress = nn.Conv2d(c1 * 2, c2, 1, bias=False)
+        self.freq_norm = nn.BatchNorm2d(c2)
+        
+        # ============ 核心2: 空间细节注意力 ============
+        # 专注于捕获小目标的空间位置
+        self.spatial_attention = nn.Sequential(
+            # 使用最大池化和平均池化捕获显著特征
+            # 小目标在这两种池化下表现不同
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+        
+        # ============ 核心3: 边缘增强卷积 ============
+        # 小目标检测最需要清晰的边缘
+        self.edge_conv = nn.Sequential(
+            nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.Conv2d(c2, c2, 1, bias=False),
+        )
+        
+        # 最终融合
+        self.fusion = nn.Sequential(
+            nn.Conv2d(c2 * 2, c2, 1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
+    
+    def high_frequency_enhance(self, x):
+        """
+        高频增强 - 这是小目标检测的关键
+        
+        原理：
+        - 小目标占据像素少，但边缘清晰
+        - 边缘信息主要存在于高频分量
+        - 通过FFT提取并增强高频部分
+        """
+        batch, channel, height, width = x.shape
+        
+        # 2D FFT
+        x_fft = torch.fft.rfft2(x, norm='ortho')
+        
+        # 创建高频掩码（中心是低频，边缘是高频）
+        h, w = x_fft.shape[2], x_fft.shape[3]
+        
+        # 高通滤波器：增强远离中心的频率
+        # 使用简单的径向距离作为权重
+        center_h, center_w = h // 2, w // 2
+        y_coords = torch.arange(h, device=x.device).view(-1, 1).float()
+        x_coords = torch.arange(w, device=x.device).view(1, -1).float()
+        
+        # 计算到中心的归一化距离
+        dist = torch.sqrt((y_coords - center_h)**2 + (x_coords / w * h - center_w)**2)
+        dist = dist / dist.max()
+        
+        # 高频掩码：距离越远（高频），权重越大
+        high_freq_mask = dist.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        
+        # 应用可学习的频率滤波器
+        freq_weight = torch.sigmoid(self.freq_filter)  # [1, C, 1, 1]
+        high_freq_mask = high_freq_mask * freq_weight * self.freq_enhance_ratio
+        
+        # 增强高频分量
+        x_fft_enhanced = x_fft * (1.0 + high_freq_mask)
+        
+        # 逆FFT
+        x_enhanced = torch.fft.irfft2(x_fft_enhanced, s=(height, width), norm='ortho')
+        
+        return x_enhanced
+    
+    def spatial_detail_attention(self, x):
+        """
+        空间细节注意力
+        
+        关键：小目标在最大池化和平均池化下的响应不同
+        - 平均池化：小目标容易被周围背景稀释
+        - 最大池化：能保留小目标的峰值响应
+        """
+        # 最大池化：保留峰值（对小目标友好）
+        max_pool = torch.max(x, dim=1, keepdim=True)[0]
+        
+        # 平均池化：全局上下文
+        avg_pool = torch.mean(x, dim=1, keepdim=True)
+        
+        # 拼接两种池化的互补信息
+        pool_concat = torch.cat([max_pool, avg_pool], dim=1)
+        
+        # 生成空间注意力图
+        attention = self.spatial_attention(pool_concat)
+        
+        return x * attention
+    
+    def edge_enhance(self, x):
+        """
+        边缘增强
+        
+        小目标最显著的特征就是边缘
+        使用深度可分离卷积提取边缘，然后加权
+        """
+        edge_features = self.edge_conv(x)
+        
+        # 残差连接：保留原始信息
+        return x + edge_features * 0.2  # 0.2是经验值，避免过度增强
     
     def forward(self, x):
         """
         前向传播
         
-        流程:
-        1. 输入x分为两个分支
-        2. cv1分支通过CAB模块处理
-        3. cv2分支保持不变
-        4. 两分支相加后输出
+        处理流程：
+        1. 频域高频增强（提取边缘）
+        2. 空间注意力（定位小目标）
+        3. 边缘增强（强化边界）
+        4. 特征融合
         """
-        # 两个分支
-        x1 = self.cv1(x)  # 处理分支
-        x2 = self.cv2(x)  # 残差分支
+        identity = x
         
-        # CAB处理（x1作为Q，x2作为K/V）
-        for cab in self.m:
-            x1 = cab(x1, x2)
+        # 1. 频域高频增强
+        freq_enhanced = self.high_frequency_enhance(x)
         
-        # 融合
-        return self.cv3(x1 + x2)
-
-
-class CAB_Block(nn.Module):
-    """CAB模块的Block包装，添加残差连接"""
-    def __init__(self, c, num_heads=4):
-        super().__init__()
-        self.cab = CAB(c, num_heads, bias=False)
-        self.norm = nn.BatchNorm2d(c)
-    
-    def forward(self, x, y):
-        return x + self.norm(self.cab(x, y))
-
-
-# ============================================================================
-# 方案2: RepC3_CAB_Hybrid - RepConv + CAB混合
-# ============================================================================
-
-class RepC3_CAB_Hybrid(nn.Module):
-    """
-    RepC3 CAB 混合版本
-    
-    特点:
-    - 结合RepConv的高效性和CAB的注意力
-    - 先用RepConv提取特征，再用CAB增强
-    - 平衡性能和效率
-    
-    结构:
-    - 奇数层: RepConv（快速特征提取）
-    - 偶数层: CAB（注意力增强）
-    - 交替使用，兼顾效率和性能
-    
-    参数:
-    - c1: 输入通道
-    - c2: 输出通道
-    - n: 总模块数
-    - num_heads: CAB的注意力头数
-    - e: expansion ratio
-    
-    性能预期:
-    - APs提升: +1.5~2.0%
-    - 参数增加: ~10%
-    - 速度: 略慢3-5%
-    
-    YAML使用:
-        - [-1, 1, RepC3_CAB_Hybrid, [256, 4]]  # [c2, n]
-    """
-    
-    def __init__(self, c1, c2, n=4, num_heads=4, e=1.0):
-        super().__init__()
-        c_ = int(c2 * e)
+        # 2. 空间细节注意力
+        spatial_attended = self.spatial_detail_attention(x)
         
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
+        # 3. 边缘增强
+        edge_enhanced = self.edge_enhance(spatial_attended)
         
-        # 交替使用RepConv和CAB
-        self.m = nn.ModuleList()
-        for i in range(n):
-            if i % 2 == 0:
-                # 偶数层：RepConv
-                self.m.append(RepConv(c_, c_))
-            else:
-                # 奇数层：CAB
-                self.m.append(CAB_Block(c_, num_heads))
+        # 4. 融合频域和空间域特征
+        combined = torch.cat([freq_enhanced, edge_enhanced], dim=1)
+        output = self.fusion(combined)
         
-        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
-    
-    def forward(self, x):
-        x1 = self.cv1(x)
-        x2 = self.cv2(x)
+        # 残差连接
+        output = output + identity
+        output = self.relu(output)
         
-        # 交替处理
-        for i, module in enumerate(self.m):
-            if i % 2 == 0:
-                # RepConv: 单输入
-                x1 = module(x1)
-            else:
-                # CAB: 双输入
-                x1 = module(x1, x2)
-        
-        return self.cv3(x1 + x2)
-
-
-# ============================================================================
-# 方案3: RepC3_CAB_Lite - 轻量级版本
-# ============================================================================
-
-class RepC3_CAB_Lite(nn.Module):
-    """
-    RepC3 CAB 轻量级版本
-    
-    特点:
-    - 减少注意力头数
-    - 使用更简单的CAB_Lite
-    - 适合资源受限场景
-    
-    优化:
-    - 单头注意力（num_heads=1）
-    - 移除temperature参数
-    - 简化投影层
-    
-    参数:
-    - c1: 输入通道
-    - c2: 输出通道
-    - n: 模块数量
-    - e: expansion ratio
-    
-    性能预期:
-    - APs提升: +1.0~1.5%
-    - 参数增加: ~5%
-    - 速度: 几乎不变
-    
-    YAML使用:
-        - [-1, 1, RepC3_CAB_Lite, [256, 3]]
-    """
-    
-    def __init__(self, c1, c2, n=3, e=1.0):
-        super().__init__()
-        c_ = int(c2 * e)
-        
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        
-        # 轻量级CAB
-        self.m = nn.ModuleList([
-            CAB_Lite(c_) for _ in range(n)
-        ])
-        
-        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
-    
-    def forward(self, x):
-        x1 = self.cv1(x)
-        x2 = self.cv2(x)
-        
-        for cab in self.m:
-            x1 = cab(x1, x2)
-        
-        return self.cv3(x1 + x2)
-
-
-class CAB_Lite(nn.Module):
-    """轻量级CAB - 单头，无temperature"""
-    def __init__(self, dim):
-        super().__init__()
-        
-        # 简化的Q/K/V生成
-        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
-        self.dwconv = nn.Conv2d(dim * 3, dim * 3, 3, 1, 1, groups=dim * 3, bias=False)
-        
-        self.project_out = nn.Conv2d(dim, dim, 1, bias=False)
-    
-    def forward(self, x, y):
-        b, c, h, w = x.shape
-        
-        # 从x生成Q，从y生成K/V
-        q = self.dwconv(self.qkv(x))[:, :c]
-        kv = self.dwconv(self.qkv(y))[:, c:]
-        k, v = kv.chunk(2, dim=1)
-        
-        # 简化为单头
-        q = rearrange(q, 'b c h w -> b c (h w)')
-        k = rearrange(k, 'b c h w -> b c (h w)')
-        v = rearrange(v, 'b c h w -> b c (h w)')
-        
-        # 归一化
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        
-        # 注意力
-        attn = (q @ k.transpose(-2, -1))
-        attn = F.softmax(attn, dim=-1)
-        
-        # 输出
-        out = attn @ v
-        out = rearrange(out, 'b c (h w) -> b c h w', h=h, w=w)
-        out = self.project_out(out)
-        
-        return x + out  # 残差连接
-
-
-# ============================================================================
-# 辅助模块
-# ==========================================================================
-class RepConv(nn.Module):
-    """RepVGG风格的卷积（简化版）"""
-    def __init__(self, c1, c2, k=3, s=1):
-        super().__init__()
-        self.conv1 = Conv(c1, c2, k, s)
-        self.conv2 = Conv(c1, c2, 1, s)
-
-    def forward(self, x):
-        return self.conv1(x) + self.conv2(x)
-
-
-
-class MSFM(nn.Module):
-    """
-    Multi-Scale Fusion Module - 多尺度融合模块
-    
-    YAML使用:
-        - [-1, 1, MSFM, [256, 3]]  # [c2, n]
-    """
-    
-    def __init__(self, c1, c2, n=3, e=1.0):
-        super().__init__()
-        c_ = int(c2 * e)
-        
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        
-        self.m = nn.ModuleList([
-            MSFMBlock(c_) for _ in range(n)
-        ])
-        
-        self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
-    
-    def forward(self, x):
-        x1 = self.cv1(x)
-        x2 = self.cv2(x)
-        
-        for block in self.m:
-            x1 = block(x1)
-        
-        return self.cv3(x1 + x2)
-
-
-class MSFMBlock(nn.Module):
-    """多尺度融合基础块"""
-    def __init__(self, c):
-        super().__init__()
-        c_inter = c // 3
-        
-        # 3个不同膨胀率的分支
-        self.branch1 = nn.Sequential(
-            nn.Conv2d(c, c_inter, 3, 1, padding=1, dilation=1, bias=False),
-            nn.BatchNorm2d(c_inter),
-            nn.SiLU()
-        )
-        
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(c, c_inter, 3, 1, padding=2, dilation=2, bias=False),
-            nn.BatchNorm2d(c_inter),
-            nn.SiLU()
-        )
-        
-        self.branch3 = nn.Sequential(
-            nn.Conv2d(c, c_inter, 3, 1, padding=3, dilation=3, bias=False),
-            nn.BatchNorm2d(c_inter),
-            nn.SiLU()
-        )
-        
-        # 通道注意力融合
-        self.fusion = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c_inter * 3, c_inter * 3 // 4, 1),
-            nn.SiLU(),
-            nn.Conv2d(c_inter * 3 // 4, c_inter * 3, 1),
-            nn.Sigmoid()
-        )
-        
-        # 输出投影
-        self.project = Conv(c_inter * 3, c, 1, 1)
-    
-    def forward(self, x):
-        b1 = self.branch1(x)
-        b2 = self.branch2(x)
-        b3 = self.branch3(x)
-        
-        concat = torch.cat([b1, b2, b3], dim=1)
-        
-        attn = self.fusion(concat)
-        fused = concat * attn
-        
-        out = self.project(fused)
-        return x + out
-
+        return output
